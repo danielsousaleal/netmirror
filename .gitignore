@@ -1,0 +1,41 @@
+# Build artifacts
+/build/
+*.o
+*.d
+*.a
+*.so
+*.gcda
+*.gcno
+*.gcov
+
+# Runtime state and logs (never commit replicated data)
+/data/
+/data*/
+/tmp/
+*.log
+*.pid
+
+# Sanitizer / debugger crash output
+core
+core.*
+vgcore.*
+*.asan.*
+*.ubsan.*
+
+# Local test fixtures
+/tests/tmp/
+/tests/fixtures/*.bin
+
+# Assistant/session artifacts
+/contexto.jsonl
+/.commandcode/
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

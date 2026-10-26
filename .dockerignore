@@ -1,0 +1,12 @@
+.git
+.github
+build
+data1
+data2
+data3
+tests
+scripts
+*.md
+*.log
+core
+core.*

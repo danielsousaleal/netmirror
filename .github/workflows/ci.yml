@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test (ASan/UBSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MODE: dev
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libssl-dev \
+            curl
+
+      # Ubuntu 24.04 runners can expose 32 bits of mmap ASLR entropy, which
+      # old sanitizer runtimes reject as "unexpected memory mapping".
+      - name: Stabilize sanitizer address space
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Check public contracts
+        run: make check
+
+      - name: Build all binaries with sanitizers
+        run: make all
+
+      - name: Run full test suite
+        run: make test
+
+  docker-validation:
+    name: Docker validation
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image with BuildKit GHA cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: netmirror:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start Compose stack and wait for health
+        run: docker compose up -d --wait --wait-timeout 180
+
+      - name: Show container health
+        run: docker compose ps
+
+      - name: HTTP PUT/GET smoke test
+        run: |
+          set -euo pipefail
+          head -c $((2 * 1024 * 1024)) /dev/urandom > /tmp/netmirror-ci-input.bin
+          curl --fail --silent --show-error --max-time 120 \
+            -X PUT \
+            -H 'Expect: 100-continue' \
+            --data-binary @/tmp/netmirror-ci-input.bin \
+            http://127.0.0.1:8080/obj/ci-object \
+            > /tmp/netmirror-ci-put.json
+          cat /tmp/netmirror-ci-put.json
+          curl --fail --silent --show-error --max-time 120 \
+            -o /tmp/netmirror-ci-output.bin \
+            http://127.0.0.1:8080/obj/ci-object
+          cmp /tmp/netmirror-ci-input.bin /tmp/netmirror-ci-output.bin
+          sha256sum \
+            /tmp/netmirror-ci-input.bin \
+            /tmp/netmirror-ci-output.bin
+
+      - name: Dump Compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color || true
+
+      - name: Tear down Compose and bind-mounted data
+        if: always()
+        run: |
+          docker compose down --remove-orphans || true
+          sudo rm -rf data1 data2 data3
+          rm -f /tmp/netmirror-ci-input.bin /tmp/netmirror-ci-output.bin /tmp/netmirror-ci-put.json

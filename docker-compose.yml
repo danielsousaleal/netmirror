@@ -1,0 +1,109 @@
+name: netmirror
+
+x-healthcheck: &healthcheck
+  interval: 3s
+  timeout: 3s
+  retries: 8
+  start_period: 5s
+
+x-node-common: &node-common
+  image: netmirror:local
+  restart: unless-stopped
+  networks:
+    - netmirror
+  stop_grace_period: 15s
+
+services:
+  node1:
+    <<: *node-common
+    container_name: netmirror-node1
+    build:
+      context: .
+      target: runtime
+    command:
+      - netmirror-node
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "9001"
+      - --node-id
+      - node1
+      - --data-dir
+      - /app/data
+      - --peers
+      - node2:9002,node3:9003
+    volumes:
+      - ./data1:/app/data
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "netmirror-cli", "node-health", "127.0.0.1", "9001"]
+
+  node2:
+    <<: *node-common
+    container_name: netmirror-node2
+    command:
+      - netmirror-node
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "9002"
+      - --node-id
+      - node2
+      - --data-dir
+      - /app/data
+      - --peers
+      - node1:9001,node3:9003
+    volumes:
+      - ./data2:/app/data
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "netmirror-cli", "node-health", "127.0.0.1", "9002"]
+
+  node3:
+    <<: *node-common
+    container_name: netmirror-node3
+    command:
+      - netmirror-node
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "9003"
+      - --node-id
+      - node3
+      - --data-dir
+      - /app/data
+      - --peers
+      - node1:9001,node2:9002
+    volumes:
+      - ./data3:/app/data
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "netmirror-cli", "node-health", "127.0.0.1", "9003"]
+
+  gateway:
+    <<: *node-common
+    container_name: netmirror-gateway
+    command:
+      - netmirror-gateway
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --nodes
+      - node1:9001,node2:9002,node3:9003
+    ports:
+      - "8080:8080"
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "netmirror-cli", "health", "http://127.0.0.1:8080"]
+
+networks:
+  netmirror:
+    driver: bridge
