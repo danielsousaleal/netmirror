@@ -43,6 +43,9 @@
  *   LIST_OBJECTS_REQ      u32 offset || u32 limit
  *   LIST_OBJECTS_RESP     u32 total || u32 returned
  *                         || returned * (u16 key_length || key bytes)
+ *   STATS_REQ             empty
+ *   STATS_RESP            u64 disk_total || u64 disk_free
+ *                         || u64 chunk_count || u64 object_count || u8 status
  *
  * LIST_KEYS_* lets anti-entropy discover manifests created while a node was
  * offline. Keys are sorted lexicographically so pagination is deterministic.
@@ -188,6 +191,16 @@ extern "C" {
 #define NM_LIST_KEYS_RESP_HEADER_SIZE 8u
 #define NM_LIST_KEYS_DEFAULT_BATCH 128u
 
+/* Exact STATS payload layout. All counters are unsigned 64-bit big-endian. */
+#define NM_STATS_RESP_WIRE_SIZE 33u
+#define NM_STATS_DISK_TOTAL_OFFSET 0u
+#define NM_STATS_DISK_FREE_OFFSET 8u
+#define NM_STATS_CHUNK_COUNT_OFFSET 16u
+#define NM_STATS_OBJECT_COUNT_OFFSET 24u
+#define NM_STATS_STATUS_OFFSET 32u
+#define NM_STATS_STATUS_OFFLINE 0u
+#define NM_STATS_STATUS_ONLINE 1u
+
 /* Operational defaults; every value can be overridden by configuration. */
 #define NM_DEFAULT_NODE_PORT 7001u
 #define NM_DEFAULT_GATEWAY_PORT 8080u
@@ -227,11 +240,13 @@ typedef enum nm_msg_type {
     NM_MSG_DELETE_OBJECT = 0x11,
     NM_MSG_REPLICA_DELETE_OBJECT = 0x12,
     NM_MSG_LIST_OBJECTS_REQ = 0x13,
-    NM_MSG_LIST_OBJECTS_RESP = 0x14
+    NM_MSG_LIST_OBJECTS_RESP = 0x14,
+    NM_MSG_STATS_REQ = 0x15,
+    NM_MSG_STATS_RESP = 0x16
 } nm_msg_type_t;
 
 #define NM_MSG_MIN NM_MSG_PING
-#define NM_MSG_MAX NM_MSG_LIST_OBJECTS_RESP
+#define NM_MSG_MAX NM_MSG_STATS_RESP
 
 /*
  * Status values. NM_OK is the only success value. Values travel on the wire
@@ -301,6 +316,8 @@ static inline uint32_t nm_quorum_size(uint32_t replicas)
 }
 
 _Static_assert(NM_FRAME_HEADER_SIZE == 9u, "frame header must be 9 bytes");
+_Static_assert(NM_STATS_RESP_WIRE_SIZE == 33u,
+               "STATS_RESP layout must stay 33 bytes");
 _Static_assert(NM_MAX_CHUNKS <= UINT32_MAX,
                "manifest chunk_count is a uint32_t");
 _Static_assert(NM_MAX_MANIFEST_SIZE <= NM_MAX_FRAME_PAYLOAD,

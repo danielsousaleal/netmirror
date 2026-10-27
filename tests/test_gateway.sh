@@ -4,6 +4,7 @@
 #   - GET hash verification
 #   - HTTP/1.1 keep-alive connection reuse
 #   - CORS, OPTIONS preflight, listing and deletion
+#   - real cluster stats and offline detection after SIGKILL
 #   - health and 404 responses
 #   - read/write fallback with one of three nodes dead
 #   - graceful shutdown under ASan/UBSan
@@ -258,6 +259,9 @@ GET_SHA=$(sha256sum "$TMP_ROOT/get.bin" | awk '{print $1}')
 [[ "$GET_SHA" == "$INPUT_SHA" ]] || die "downloaded SHA-256 mismatch"
 grep -qi '^Connection: keep-alive' "$TMP_ROOT/get.headers" ||
     die "GET response did not advertise keep-alive"
+grep -qi '^Content-Disposition: attachment; filename="gateway-alpha"' \
+    "$TMP_ROOT/get.headers" ||
+    die "GET response did not emit Content-Disposition"
 
 # Two transfers in one curl process: the second must reuse the connection.
 CONNECTS=$(curl -sS --http1.1 --max-time 45 -o /dev/null -o /dev/null \
@@ -394,12 +398,79 @@ MISSING_DELETE_CODE=$(curl -sS --max-time 10 -X DELETE -o /dev/null \
 [[ "$MISSING_DELETE_CODE" == "404" ]] ||
     die "DELETE missing returned $MISSING_DELETE_CODE, expected 404"
 
+# Stats endpoint with all nodes online: real disk/object/chunk counts.
+STATS_CODE=$(curl -sS --max-time 10 -o "$TMP_ROOT/stats-up.json" \
+    -w '%{http_code}' \
+    "http://127.0.0.1:$PORT_GATEWAY/cluster/stats") ||
+    die "GET /cluster/stats failed"
+[[ "$STATS_CODE" == "200" ]] ||
+    die "/cluster/stats returned $STATS_CODE, expected 200"
+STATS_ONLINE=$(grep -o '"status":"online"' "$TMP_ROOT/stats-up.json" |
+    wc -l | tr -d ' ')
+[[ "$STATS_ONLINE" == "3" ]] ||
+    die "/cluster/stats reported $STATS_ONLINE online nodes, expected 3"
+grep -Eq '"total_objects":[1-9]' "$TMP_ROOT/stats-up.json" ||
+    die "/cluster/stats total_objects is zero"
+grep -Eq '"total_chunks":[1-9]' "$TMP_ROOT/stats-up.json" ||
+    die "/cluster/stats total_chunks is zero"
+
+# Activity log must contain real upload and delete events.
+ACTIVITY_CODE=$(curl -sS --max-time 10 -o "$TMP_ROOT/activity-up.json" \
+    -w '%{http_code}' \
+    "http://127.0.0.1:$PORT_GATEWAY/cluster/activity") ||
+    die "GET /cluster/activity failed"
+[[ "$ACTIVITY_CODE" == "200" ]] ||
+    die "/cluster/activity returned $ACTIVITY_CODE, expected 200"
+grep -q '"events"' "$TMP_ROOT/activity-up.json" ||
+    die "/cluster/activity has no events array"
+grep -q '"type":"gateway_started"' "$TMP_ROOT/activity-up.json" ||
+    die "/cluster/activity has no gateway_started event"
+grep -q '"type":"upload"' "$TMP_ROOT/activity-up.json" ||
+    die "/cluster/activity has no upload event"
+grep -q 'gateway-alpha' "$TMP_ROOT/activity-up.json" ||
+    die "upload event for gateway-alpha is missing"
+grep -q '"type":"download"' "$TMP_ROOT/activity-up.json" ||
+    die "/cluster/activity has no download event"
+grep -q 'Object gateway-alpha downloaded' "$TMP_ROOT/activity-up.json" ||
+    die "download event for gateway-alpha is missing"
+grep -q '"type":"delete"' "$TMP_ROOT/activity-up.json" ||
+    die "/cluster/activity has no delete event"
+grep -q 'api-shared-a' "$TMP_ROOT/activity-up.json" ||
+    die "delete event for api-shared-a is missing"
+
 # Kill a replica. Reads must fall back and writes still reach 2-of-3 quorum.
 KILLED_NODE3=$PID3
 kill -KILL "$KILLED_NODE3" 2>/dev/null || die "could not kill node3"
 wait "$KILLED_NODE3" 2>/dev/null || true
 PID3=""
 sleep 1.5
+
+# The stats fan-out must mark the killed node offline with zeroed counters.
+STATS_CODE=$(curl -sS --max-time 10 -o "$TMP_ROOT/stats-down.json" \
+    -w '%{http_code}' \
+    "http://127.0.0.1:$PORT_GATEWAY/cluster/stats") ||
+    die "GET /cluster/stats with node3 down failed"
+[[ "$STATS_CODE" == "200" ]] ||
+    die "/cluster/stats with node3 down returned $STATS_CODE"
+STATS_OFFLINE=$(grep -o '"status":"offline"' "$TMP_ROOT/stats-down.json" |
+    wc -l | tr -d ' ')
+[[ "$STATS_OFFLINE" == "1" ]] ||
+    die "/cluster/stats reported $STATS_OFFLINE offline nodes, expected 1"
+grep -q "\"id\":\"127.0.0.1:$PORT3\",\"status\":\"offline\",\"disk_total\":0,\"disk_free\":0,\"objects\":0" \
+    "$TMP_ROOT/stats-down.json" ||
+    die "killed node is not reported offline with zeroed counters"
+
+ACTIVITY_CODE=$(curl -sS --max-time 10 -o "$TMP_ROOT/activity-down.json" \
+    -w '%{http_code}' \
+    "http://127.0.0.1:$PORT_GATEWAY/cluster/activity") ||
+    die "GET /cluster/activity after SIGKILL failed"
+[[ "$ACTIVITY_CODE" == "200" ]] ||
+    die "/cluster/activity after SIGKILL returned $ACTIVITY_CODE"
+grep -q '"type":"node_offline"' "$TMP_ROOT/activity-down.json" ||
+    die "/cluster/activity has no node_offline event"
+grep -q "\"message\":\"Node 127.0.0.1:$PORT3 is offline\"" \
+    "$TMP_ROOT/activity-down.json" ||
+    die "node_offline event for the killed node is missing"
 
 CODE=$(http_get "gateway-alpha" "$TMP_ROOT/get-after-down.bin" \
     "$TMP_ROOT/get-after-down.headers")
@@ -461,5 +532,5 @@ PID2=""
 stop_gracefully "$PID3" "node3" "$LOG3"
 PID3=""
 
-echo "test_gateway: 10MiB streaming, keep-alive, 100-continue, CORS, list/delete, tombstone repair, fallback and shutdown passed"
+echo "test_gateway: 10MiB streaming, keep-alive, 100-continue, CORS, list/delete, stats/activity/SIGKILL, tombstone repair, fallback and shutdown passed"
 exit 0

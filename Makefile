@@ -3,7 +3,7 @@
 # Default build is the sanitizer-enabled development build:
 #   make                 # all binaries, ASan + UBSan
 #   make test            # every unit/integration suite + E2E fire test
-#   make demo            # docker compose up --build (3 nodes + gateway)
+#   make demo            # build image + docker compose up (3 nodes + gateway)
 #   make MODE=release    # optimized binaries without sanitizers
 #
 # Build artifacts live under build/<mode>/ and must never be committed.
@@ -157,7 +157,8 @@ test: all test-core test-network test-node test-cluster test-gateway
 	MODE="$(MODE)" $(SANITIZER_ENV) bash tests/test.sh
 
 demo:
-	docker compose up --build --remove-orphans
+	docker compose build
+	docker compose up --remove-orphans
 
 dev:
 	@$(MAKE) --no-print-directory MODE=dev all
@@ -189,7 +190,7 @@ help:
 	@echo "  make test-cluster     run 3-node quorum/heartbeat/repair tests"
 	@echo "  make test-gateway     run HTTP streaming/keep-alive/fallback tests"
 	@echo "  make test             run every test suite + full E2E fire test"
-	@echo "  make demo             docker compose up --build (3 nodes + gateway)"
+	@echo "  make demo             build image + docker compose up (3 nodes + gateway)"
 	@echo "  make MODE=release     optimized build under build/release/"
 	@echo "  make clean            remove build artifacts"
 	@echo "  make print-config     show effective build settings"

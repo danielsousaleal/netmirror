@@ -7,6 +7,8 @@ x-healthcheck: &healthcheck
   start_period: 5s
 
 x-node-common: &node-common
+  # All services share this image. Only node1 builds it: Compose/Bake cannot
+  # build the same image tag from multiple services concurrently.
   image: netmirror:local
   restart: unless-stopped
   networks:
@@ -17,6 +19,7 @@ services:
   node1:
     <<: *node-common
     container_name: netmirror-node1
+    # Build the shared netmirror:local image exactly once.
     build:
       context: .
       target: runtime

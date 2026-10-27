@@ -1,198 +1,472 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import Link from "next/link";
+import {
+  Activity,
+  Database,
+  Download,
+  HardDrive,
+  Layers3,
+  Loader2,
+  Server,
+  ShieldAlert,
+  ShieldCheck,
+  Trash2,
+  Upload,
+} from "lucide-react";
 
-type HealthPayload = {
-  status?: string;
-  nodes?: number;
-};
+import { useClusterHealth } from "@/components/health/HealthProvider";
+import {
+  formatBytes,
+  formatPercent,
+  formatRelativeTime,
+} from "@/lib/format";
 
-type ConnectionState = "checking" | "online" | "offline";
+function usedBytes(diskTotal: number, diskFree: number): number {
+  return Math.max(0, diskTotal - diskFree);
+}
 
-const features = [
-  {
-    title: "2-of-3 quorum",
-    body: "Every write is acknowledged by at least two replicas before the gateway reports success.",
-  },
-  {
-    title: "Content-addressed",
-    body: "Objects are split into 4 MiB chunks named by SHA-256. Identical chunks are stored once.",
-  },
-  {
-    title: "Self-healing",
-    body: "Heartbeats detect failures and anti-entropy pulls missing manifests and chunks after downtime.",
-  },
-];
+export default function OverviewPage() {
+  const { state, stats, activity } = useClusterHealth();
 
-export default function Home() {
-  const [state, setState] = useState<ConnectionState>("checking");
-  const [nodes, setNodes] = useState<number | null>(null);
-  const [lastChecked, setLastChecked] = useState<Date | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const check = async () => {
-      try {
-        const response = await fetch("/api/health", { cache: "no-store" });
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const payload = (await response.json()) as HealthPayload;
-        if (cancelled) {
-          return;
-        }
-        setState(payload.status === "ok" ? "online" : "offline");
-        setNodes(typeof payload.nodes === "number" ? payload.nodes : null);
-      } catch {
-        if (!cancelled) {
-          setState("offline");
-          setNodes(null);
-        }
-      } finally {
-        if (!cancelled) {
-          setLastChecked(new Date());
-        }
-      }
-    };
-
-    void check();
-    const timer = window.setInterval(() => void check(), 5000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [refreshKey]);
-
-  const online = state === "online";
+  const nodes = stats?.nodes ?? [];
+  const onlineNodes = nodes.filter((node) => node.status === "online");
+  const allOnline = state === "online";
   const checking = state === "checking";
-  const statusLabel = checking
-    ? "Checking cluster…"
-    : online
-      ? "Cluster Online"
-      : "Cluster Offline";
-  const statusDetail = checking
-    ? "Contacting /api/health…"
-    : online
-      ? `${nodes ?? "?"} nodes reporting healthy`
-      : "The gateway did not answer /api/health.";
+  const offlineCount = nodes.length - onlineNodes.length;
+
+  const totalCapacity = onlineNodes.reduce(
+    (sum, node) => sum + node.disk_total,
+    0,
+  );
+  const usedCapacity = onlineNodes.reduce(
+    (sum, node) => sum + usedBytes(node.disk_total, node.disk_free),
+    0,
+  );
+  const usagePercent =
+    totalCapacity > 0
+      ? Math.min(100, (usedCapacity / totalCapacity) * 100)
+      : 0;
+
+  const totalObjects = stats?.total_objects ?? null;
+  const totalChunks = stats?.total_chunks ?? null;
+  const replicas = nodes.length > 0 ? nodes.length : null;
+
+  const healthLabel = allOnline ? "HEALTH_OK" : "HEALTH_WARN";
+  const healthDescription = allOnline
+    ? "All services are operational"
+    : checking
+      ? "Checking cluster health..."
+      : stats === null
+        ? "Cluster stats unavailable"
+        : "One or more nodes are offline";
+  const healthDetail = allOnline
+    ? `${onlineNodes.length} of ${nodes.length} nodes online`
+    : checking
+      ? "Contacting /api/cluster/stats..."
+      : stats === null
+        ? "The stats endpoint did not respond."
+        : `${offlineCount} of ${nodes.length} nodes offline`;
+  const healthTone = allOnline
+    ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-500"
+    : "border-amber-500/20 bg-amber-500/10 text-amber-500";
+  const healthLabelTone = allOnline ? "text-emerald-500" : "text-amber-500";
+  const HealthIcon = checking ? Loader2 : allOnline ? ShieldCheck : ShieldAlert;
+
+  const poolStatus = allOnline ? "Healthy" : checking ? "Checking" : "Degraded";
+  const poolTone = allOnline
+    ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-500"
+    : "border-amber-500/20 bg-amber-500/10 text-amber-500";
 
   return (
-    <main className="relative min-h-screen overflow-hidden">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(16,185,129,0.16),transparent_35%),radial-gradient(circle_at_80%_20%,rgba(56,189,248,0.1),transparent_30%)]" />
-      <div className="relative mx-auto flex min-h-screen w-full max-w-5xl flex-col px-6 py-10 sm:px-10">
-        <header className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="grid h-10 w-10 place-items-center rounded-xl border border-emerald-400/30 bg-emerald-400/10 text-sm font-semibold text-emerald-300">
-              nm
+    <div className="space-y-6">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-zinc-50">
+            Cluster Overview
+          </h1>
+          <p className="mt-1 text-sm text-zinc-400">
+            Distributed storage health at a glance
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Link
+            href="/files#upload"
+            className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-500 px-3 text-sm font-medium text-zinc-950 transition-colors hover:bg-emerald-400"
+          >
+            <Upload className="h-4 w-4" />
+            Upload File
+          </Link>
+          <a
+            href="#nodes"
+            className="inline-flex h-9 items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900 px-3 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-50"
+          >
+            <Server className="h-4 w-4" />
+            Manage Nodes
+          </a>
+        </div>
+      </div>
+
+      <section className="w-full rounded-xl border border-zinc-800 bg-zinc-900 p-6">
+        <div className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex items-start gap-4">
+            <div
+              className={`grid h-12 w-12 shrink-0 place-items-center rounded-xl border ${healthTone}`}
+            >
+              <HealthIcon
+                className={`h-6 w-6 ${checking ? "animate-spin" : ""}`}
+              />
             </div>
             <div>
-              <p className="text-sm font-semibold tracking-[0.22em] text-slate-200">
-                NETMIRROR
+              <p
+                className={`text-xs font-semibold tracking-[0.18em] ${healthLabelTone}`}
+              >
+                {healthLabel}
               </p>
-              <p className="text-xs text-slate-500">
-                Replicated object store
+              <h2 className="mt-1 text-lg font-medium text-zinc-50">
+                {healthDescription}
+              </h2>
+              <p className="mt-1 text-sm text-zinc-400">{healthDetail}</p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4 sm:gap-6 lg:gap-8">
+            <div>
+              <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500 sm:text-[11px]">
+                <HardDrive className="h-3.5 w-3.5" />
+                Total Capacity
+              </div>
+              <p className="mt-1.5 text-base font-semibold text-zinc-50 sm:text-lg">
+                {stats === null ? "—" : formatBytes(totalCapacity)}
+              </p>
+            </div>
+            <div>
+              <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500 sm:text-[11px]">
+                <Database className="h-3.5 w-3.5" />
+                Used
+              </div>
+              <p className="mt-1.5 text-base font-semibold text-zinc-50 sm:text-lg">
+                {stats === null ? "—" : formatBytes(usedCapacity)}
+                <span className="ml-1 text-xs font-normal text-zinc-500">
+                  / {stats === null ? "—" : formatPercent(usagePercent)}
+                </span>
+              </p>
+            </div>
+            <div>
+              <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500 sm:text-[11px]">
+                <Layers3 className="h-3.5 w-3.5" />
+                Objects
+              </div>
+              <p className="mt-1.5 text-base font-semibold text-zinc-50 sm:text-lg">
+                {totalObjects === null
+                  ? "—"
+                  : totalObjects.toLocaleString("en-US")}
+              </p>
+            </div>
+            <div>
+              <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500 sm:text-[11px]">
+                <Server className="h-3.5 w-3.5" />
+                Replicas
+              </div>
+              <p className="mt-1.5 text-base font-semibold text-zinc-50 sm:text-lg">
+                {replicas === null ? "—" : `${replicas}x`}
               </p>
             </div>
           </div>
-          <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-400">
-            v2.0 · web
-          </span>
-        </header>
+        </div>
 
-        <section className="mt-16 grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
-          <div className="rounded-3xl border border-white/10 bg-white/[0.035] p-8 shadow-2xl shadow-black/30 backdrop-blur">
-            <p className="text-xs font-medium uppercase tracking-[0.24em] text-slate-500">
-              Gateway status
-            </p>
+        <div className="mt-6">
+          <div className="h-1.5 overflow-hidden rounded-full bg-zinc-800">
+            <div
+              className="h-full rounded-full bg-emerald-500 transition-[width]"
+              style={{ width: `${stats === null ? 0 : usagePercent}%` }}
+            />
+          </div>
+          <div className="mt-2 flex items-center justify-between text-[11px] text-zinc-500">
+            <span>
+              {stats === null ? "—" : `${formatBytes(usedCapacity)} used`}
+            </span>
+            <span>
+              {stats === null
+                ? "—"
+                : `${formatPercent(usagePercent)} of ${formatBytes(totalCapacity)}`}
+            </span>
+          </div>
+        </div>
+      </section>
 
-            <div className="mt-6 flex items-center gap-4" aria-live="polite">
-              <span className="relative flex h-4 w-4">
-                {online ? (
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
-                ) : null}
-                <span
-                  className={`relative inline-flex h-4 w-4 rounded-full ${
-                    checking
-                      ? "bg-amber-400 shadow-[0_0_18px_rgba(251,191,36,0.65)]"
-                      : online
-                        ? "bg-emerald-400 shadow-[0_0_18px_rgba(52,211,153,0.8)]"
-                        : "bg-rose-500 shadow-[0_0_18px_rgba(244,63,94,0.65)]"
-                  }`}
-                />
-              </span>
-              <div>
-                <h1 className="text-3xl font-semibold tracking-tight text-white">
-                  {statusLabel}
-                </h1>
-                <p className="mt-1 text-sm text-slate-400">{statusDetail}</p>
-              </div>
+      <div className="grid gap-6 lg:grid-cols-2">
+        <section
+          id="nodes"
+          className="scroll-mt-24 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900"
+        >
+          <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
+            <div>
+              <h2 className="text-sm font-semibold text-zinc-50">
+                Storage Nodes
+              </h2>
+              <p className="mt-1 text-xs text-zinc-500">Replication members</p>
             </div>
-
-            <dl className="mt-8 grid gap-4 sm:grid-cols-2">
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                <dt className="text-xs uppercase tracking-wider text-slate-500">
-                  Endpoint
-                </dt>
-                <dd className="mt-1 font-mono text-sm text-slate-200">
-                  /api/health
-                </dd>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                <dt className="text-xs uppercase tracking-wider text-slate-500">
-                  Last check
-                </dt>
-                <dd className="mt-1 font-mono text-sm text-slate-200">
-                  {lastChecked ? lastChecked.toLocaleTimeString() : "—"}
-                </dd>
-              </div>
-            </dl>
-
-            <div className="mt-8 flex flex-wrap items-center gap-3">
-              <button
-                type="button"
-                onClick={() => {
-                  setState("checking");
-                  setRefreshKey((value) => value + 1);
-                }}
-                className="rounded-full bg-emerald-400 px-5 py-2.5 text-sm font-semibold text-emerald-950 transition-colors hover:bg-emerald-300"
-              >
-                Check again
-              </button>
-              <a
-                href="/api/objects"
-                target="_blank"
-                rel="noreferrer"
-                className="rounded-full border border-white/15 px-5 py-2.5 text-sm font-medium text-slate-300 transition-colors hover:border-white/30 hover:text-white"
-              >
-                Raw objects JSON ↗
-              </a>
-            </div>
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-zinc-800 bg-zinc-800/50 px-2.5 py-1 text-[11px] text-zinc-400">
+              <Server className="h-3 w-3" />
+              {stats === null
+                ? "—"
+                : `${onlineNodes.length}/${nodes.length} online`}
+            </span>
           </div>
 
-          <div className="grid gap-4">
-            {features.map((feature) => (
-              <article
-                key={feature.title}
-                className="rounded-2xl border border-white/10 bg-white/[0.025] p-5"
-              >
-                <div className="mb-2 h-1 w-8 rounded-full bg-emerald-400/70" />
-                <h2 className="text-sm font-semibold text-slate-100">
-                  {feature.title}
-                </h2>
-                <p className="mt-1 text-sm leading-6 text-slate-400">
-                  {feature.body}
-                </p>
-              </article>
-            ))}
-          </div>
+          {stats === null ? (
+            <div className="px-5 py-12 text-center text-sm text-zinc-500">
+              {checking
+                ? "Loading cluster stats..."
+                : "Unable to load cluster stats. Use Refresh to retry."}
+            </div>
+          ) : nodes.length === 0 ? (
+            <div className="px-5 py-12 text-center text-sm text-zinc-500">
+              No nodes reported.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[540px] text-left text-sm">
+                <thead>
+                  <tr className="border-b border-zinc-800 text-[11px] uppercase tracking-wider text-zinc-500">
+                    <th className="px-5 py-3 font-medium">Node</th>
+                    <th className="px-5 py-3 font-medium">Objects</th>
+                    <th className="px-5 py-3 font-medium">Disk Usage</th>
+                    <th className="px-5 py-3 text-right font-medium">
+                      Status
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-800">
+                  {nodes.map((node) => {
+                    const onlineNode = node.status === "online";
+                    const diskUsed = usedBytes(
+                      node.disk_total,
+                      node.disk_free,
+                    );
+                    const diskPercent =
+                      node.disk_total > 0
+                        ? Math.min(
+                            100,
+                            (diskUsed / node.disk_total) * 100,
+                          )
+                        : 0;
+                    const nodeBadge = onlineNode
+                      ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-500"
+                      : "border-red-500/20 bg-red-500/10 text-red-500";
+                    const nodeDot = onlineNode
+                      ? "bg-emerald-500"
+                      : "bg-red-500";
+
+                    return (
+                      <tr key={node.id} className="hover:bg-zinc-800/30">
+                        <td className="px-5 py-4">
+                          <div className="flex items-center gap-2">
+                            <Server className="h-4 w-4 shrink-0 text-zinc-500" />
+                            <div className="min-w-0">
+                              <p
+                                className="truncate font-mono text-[13px] text-zinc-200"
+                                title={node.id}
+                              >
+                                {node.id}
+                              </p>
+                              <p className="text-[11px] text-zinc-500">
+                                Storage node
+                              </p>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-5 py-4 text-sm text-zinc-400">
+                          {onlineNode
+                            ? node.objects.toLocaleString("en-US")
+                            : "—"}
+                        </td>
+                        <td className="px-5 py-4">
+                          {onlineNode && node.disk_total > 0 ? (
+                            <div className="flex items-center gap-2">
+                              <div className="h-1.5 w-24 overflow-hidden rounded-full bg-zinc-800">
+                                <div
+                                  className="h-full rounded-full bg-emerald-500"
+                                  style={{ width: `${diskPercent}%` }}
+                                />
+                              </div>
+                              <span className="text-xs text-zinc-400">
+                                {formatPercent(diskPercent)}
+                              </span>
+                            </div>
+                          ) : (
+                            <span className="text-xs text-zinc-500">—</span>
+                          )}
+                        </td>
+                        <td className="px-5 py-4 text-right">
+                          <span
+                            className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${nodeBadge}`}
+                          >
+                            <span
+                              className={`h-1.5 w-1.5 rounded-full ${nodeDot}`}
+                            />
+                            {onlineNode ? "Online" : "Offline"}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </section>
 
-        <footer className="mt-auto pt-10 text-xs text-slate-600">
-          netmirror · HTTP/1.1 gateway · 2-of-3 quorum
-        </footer>
+        <section className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900">
+          <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
+            <div>
+              <h2 className="text-sm font-semibold text-zinc-50">
+                Storage Pools
+              </h2>
+              <p className="mt-1 text-xs text-zinc-500">
+                Capacity allocation
+              </p>
+            </div>
+            <Database className="h-4 w-4 text-zinc-500" />
+          </div>
+
+          <div className="p-5">
+            <div className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium text-zinc-200">
+                    Replicated Objects
+                  </p>
+                  <p className="mt-1 text-xs text-zinc-500">
+                    Content-addressed pool · {replicas ?? "—"} replicas
+                  </p>
+                </div>
+                <span
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${poolTone}`}
+                >
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      allOnline ? "bg-emerald-500" : "bg-amber-500"
+                    }`}
+                  />
+                  {poolStatus}
+                </span>
+              </div>
+
+              <div className="mt-5 flex items-end justify-between text-xs">
+                <span className="text-zinc-400">
+                  {stats === null ? "—" : `${formatBytes(usedCapacity)} used`}
+                </span>
+                <span className="text-zinc-500">
+                  {stats === null ? "—" : `${formatBytes(totalCapacity)} total`}
+                </span>
+              </div>
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-800">
+                <div
+                  className="h-full rounded-full bg-emerald-500 transition-[width]"
+                  style={{ width: `${stats === null ? 0 : usagePercent}%` }}
+                />
+              </div>
+
+              <div className="mt-4 grid grid-cols-3 gap-3 text-center">
+                <div>
+                  <p className="text-[10px] uppercase tracking-wider text-zinc-500">
+                    Objects
+                  </p>
+                  <p className="mt-1 text-sm font-medium text-zinc-200">
+                    {totalObjects === null
+                      ? "—"
+                      : totalObjects.toLocaleString("en-US")}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] uppercase tracking-wider text-zinc-500">
+                    Chunks
+                  </p>
+                  <p className="mt-1 text-sm font-medium text-zinc-200">
+                    {totalChunks === null
+                      ? "—"
+                      : totalChunks.toLocaleString("en-US")}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] uppercase tracking-wider text-zinc-500">
+                    Replication
+                  </p>
+                  <p className="mt-1 text-sm font-medium text-zinc-200">
+                    {replicas === null ? "—" : `${replicas}x`}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
       </div>
-    </main>
+
+      <section className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900">
+        <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
+          <div>
+            <h2 className="text-sm font-semibold text-zinc-50">
+              Recent Activity
+            </h2>
+            <p className="mt-1 text-xs text-zinc-500">Latest cluster events</p>
+          </div>
+          <Activity className="h-4 w-4 text-zinc-500" />
+        </div>
+        {activity.length === 0 ? (
+          <div className="px-5 py-10 text-center">
+            <p className="text-sm text-zinc-500">No recent activity.</p>
+            <p className="mt-1 text-xs text-zinc-600">
+              Events appear after uploads, deletes, or node status changes.
+            </p>
+          </div>
+        ) : (
+          <ul className="max-h-[24rem] divide-y divide-zinc-800 overflow-y-auto">
+            {activity.map((event) => {
+              const Icon =
+                event.type === "upload"
+                  ? Upload
+                  : event.type === "download"
+                    ? Download
+                    : event.type === "delete"
+                      ? Trash2
+                      : event.type.startsWith("node_")
+                        ? Server
+                        : Activity;
+              const tone =
+                event.type === "node_offline"
+                  ? "border-red-500/20 bg-red-500/10 text-red-500"
+                  : event.type === "delete"
+                    ? "border-amber-500/20 bg-amber-500/10 text-amber-500"
+                    : event.type === "upload" ||
+                        event.type === "download" ||
+                        event.type === "node_online"
+                      ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-500"
+                      : "border-zinc-700 bg-zinc-800 text-zinc-400";
+
+              return (
+                <li
+                  key={event.id}
+                  className="flex items-center gap-3 px-5 py-3.5"
+                >
+                  <div
+                    className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg border ${tone}`}
+                  >
+                    <Icon className="h-4 w-4" />
+                  </div>
+                  <p className="min-w-0 flex-1 truncate text-sm text-zinc-400">
+                    {event.message}
+                  </p>
+                  <span className="shrink-0 text-[11px] text-zinc-500">
+                    {formatRelativeTime(event.timestamp)}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+    </div>
   );
 }

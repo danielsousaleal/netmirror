@@ -66,8 +66,11 @@ The only requirement is Docker with Compose v2.
 ```bash
 git clone https://github.com/danielsousaleal/netmirror.git
 cd netmirror
-docker compose up -d --build --wait
+docker compose build && docker compose up -d --wait
 ```
+
+`docker compose build` creates the shared `netmirror:local` image once; the
+second command starts all four services from it.
 
 That starts three storage nodes (ports 9001-9003, internal) and one gateway on
 `http://localhost:8080`.
@@ -107,7 +110,7 @@ stdout.
 ### Other ways to run it
 
 ```bash
-make demo        # docker compose up --build in the foreground
+make demo        # build image + docker compose up in the foreground
 make test        # every unit/integration suite + end-to-end fire test
 docker compose down
 rm -rf data1 data2 data3   # wipe the bind-mounted node data
@@ -115,14 +118,19 @@ rm -rf data1 data2 data3   # wipe the bind-mounted node data
 
 ## Web UI
 
-`ui/` is a Next.js App Router dashboard (TypeScript + Tailwind CSS). It polls
-`/api/health` and shows the cluster status with a green indicator when online.
+`ui/` is a Next.js App Router dashboard (TypeScript + Tailwind CSS) with three
+routes: `/` (cluster overview), `/files` (File Manager + Upload), and
+`/settings`. The shared health provider polls `/api/cluster/stats` and
+`/api/cluster/activity` every five seconds; node status, disk usage, object
+counts, capacity, and Recent Activity come from the C cluster. The status is
+amber (`WARNING`) when any node is offline or the stats endpoint fails.
+`/api/health` remains available, but it is only a shallow gateway check.
 `next.config.ts` rewrites `/api/*` to the gateway, so browser calls stay
 same-origin during development.
 
 ```bash
 # Terminal 1: C cluster + gateway
-docker compose up -d --build --wait
+docker compose build && docker compose up -d --wait
 
 # Terminal 2: dashboard
 cd ui
@@ -130,17 +138,27 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). The proxy defaults to
-`http://localhost:8080`; override it with `NETMIRROR_GATEWAY`. The UI is
-validated with `npm run lint` and `npm run build`.
+Open [http://localhost:3000](http://localhost:3000). Control-plane calls
+(`/api/cluster/stats`, `/api/cluster/activity`, `/api/objects`) use the Next rewrite, which defaults to
+`http://localhost:8080`; override the server target with `NETMIRROR_GATEWAY`.
+Object uploads and downloads go **directly from the browser to the gateway**.
+The Next rewrite proxy limits request bodies to 10 MB and adds an extra hop for
+large responses, so it is reserved for control-plane calls. The browser-side
+target defaults to the UI hostname on port 8080; set
+`NEXT_PUBLIC_GATEWAY_URL` when the gateway is on another origin, for example
+`NEXT_PUBLIC_GATEWAY_URL=http://192.168.1.10:8080`. The gateway sends
+`Content-Disposition: attachment` on downloads and already enables CORS for
+`PUT`/`OPTIONS`. The UI is validated with `npm run lint` and `npm run build`.
 
 ## HTTP API
 
 | Method    | Path          | Success | Description                                      |
 | --------- | ------------- | ------- | ------------------------------------------------ |
-| `GET`     | `/health`     | `200`   | Gateway liveness as JSON                         |
+| `GET`     | `/health`     | `200`   | Shallow gateway liveness as JSON                 |
+| `GET`     | `/cluster/stats` | `200` | Per-node disk/object stats and cluster totals   |
+| `GET`     | `/cluster/activity` | `200` | Last 50 real gateway events, newest first  |
 | `GET`     | `/objects`    | `200`   | Live keys as `{"objects":["key1","key2"]}`       |
-| `GET`     | `/obj/<key>`  | `200`   | Stream the object; `ETag` and `X-Content-SHA256` |
+| `GET`     | `/obj/<key>`  | `200`   | Stream the object; `ETag`, SHA-256, disposition  |
 | `GET`     | `/obj`        | `200`   | Same as `/obj/default`                           |
 | `PUT`     | `/obj/<key>`  | `201`   | Stream an object; requires `Content-Length`      |
 | `PUT`     | `/obj`        | `201`   | Same as `/obj/default`                           |
@@ -312,6 +330,64 @@ shared by other objects survive. Anti-entropy can transiently pull chunks from a
 stale replica before that replica sees the tombstone; a full garbage collector
 is still future work.
 
+### Cluster stats
+
+Each node answers `STATS_REQ` with:
+
+- `disk_total` and `disk_free` from `statvfs()` on its data directory;
+- `chunk_count` from the local content-addressed chunk store;
+- `object_count` from the local live manifests (tombstones excluded);
+- an online/offline status byte.
+
+The gateway fans the request out to every configured node in parallel with a
+2-second socket timeout. Nodes that do not answer are reported as `offline`
+with zeroed counters:
+
+```json
+{
+  "nodes": [
+    {"id": "127.0.0.1:9001", "status": "online", "disk_total": 50000000000, "disk_free": 48000000000, "objects": 12},
+    {"id": "127.0.0.1:9002", "status": "offline", "disk_total": 0, "disk_free": 0, "objects": 0}
+  ],
+  "total_objects": 12,
+  "total_chunks": 15
+}
+```
+
+Because objects and chunks are replicated, `total_objects` and `total_chunks`
+are the maximum across online replicas (the logical cluster view), not sums of
+the physical copies. The dashboard reads this endpoint through the Next proxy
+as `/api/cluster/stats`.
+
+### Activity log
+
+The gateway keeps a 50-event in-memory ring of real events:
+
+- `gateway_started` when the gateway boots;
+- `upload` after an object manifest commits;
+- `download` after the full object stream succeeds;
+- `delete` after a quorum delete succeeds;
+- `node_online` / `node_offline` when `/cluster/stats` observes a status change.
+
+`GET /cluster/activity` returns the newest event first:
+
+```json
+{
+  "events": [
+    {
+      "id": 12,
+      "type": "upload",
+      "message": "Object video.mp4 uploaded (10485760 bytes)",
+      "timestamp": 1792540800000
+    }
+  ]
+}
+```
+
+The dashboard reads this endpoint through the Next proxy as
+`/api/cluster/activity`. The log lives in gateway memory and resets when the
+gateway restarts; it is not a durable audit log.
+
 ### Heartbeats, reconnects, and anti-entropy
 
 - Each node keeps one persistent non-blocking outbound TCP connection per peer.
@@ -436,9 +512,10 @@ Binaries land in `build/<mode>/bin/`:
 | `make test-network` | Framing, partial parser, byte order, buffers                    |
 | `make test-node`    | Binary protocol server, ACK/ERROR paths, graceful shutdown      |
 | `make test-cluster` | Quorum, crash/recovery, anti-entropy, lone-node rejection       |
-| `make test-gateway` | Streaming, keep-alive, CORS, list/delete, tombstone repair      |
+| `make test-gateway` | Streaming, CORS, download/activity, stats/SIGKILL, tombstone repair |
 | `make test`         | All of the above plus the end-to-end scenario                   |
 
+The gateway test verifies `Content-Disposition` and the activity download event.
 The end-to-end test uploads small, 12 MiB, and empty objects, verifies their
 SHA-256 after download, kills one node and reads again, uploads with two nodes
 alive, kills another node and confirms that writes are rejected while reads
@@ -488,10 +565,14 @@ limitations are deliberate:
 - **Single-threaded storage nodes.** One slow disk stalls that node's event
   loop. Chunk writes and `fsync` are synchronous by design in v1. The gateway
   uses one worker thread per HTTP connection with a hard connection cap.
-- **The `/health` endpoint is shallow.** It reports that the gateway process is
-  alive, not that the storage nodes are reachable. Container health checks use
-  the binary `node-health` probe; the gateway health check only proves the
-  HTTP front end responds.
+- **`/health` is shallow; `/cluster/stats` is the dashboard feed.** `/health`
+  only reports that the gateway process is alive. `/cluster/stats` queries every
+  node for `statvfs()` data and live object/chunk counts with a 2-second timeout,
+  and reports non-responding nodes as offline. Container health checks still use
+  the binary `node-health` probe.
+- **Recent Activity is in-memory, not a durable audit log.** The gateway keeps
+  the last 50 upload, delete, and node-status events and resets them when it
+  restarts.
 - **Listing is eventually consistent.** `GET /objects` is served by one
   replica. A stale replica can briefly include a key after a quorum delete until
   the tombstone reaches it. `GET /obj/<key>` compares replicas, so it returns

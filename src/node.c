@@ -40,6 +40,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #define NODE_EPOLL_BATCH 64
@@ -1066,6 +1067,66 @@ static node_dispatch_result_t handle_delete_object(
                                        key_digest);
 }
 
+static node_dispatch_result_t handle_stats(node_server_t *server,
+                                           node_connection_t *connection,
+                                           const nm_frame_t *frame)
+{
+    struct statvfs vfs;
+    const char *root;
+    uint8_t *hashes = NULL;
+    char **keys = NULL;
+    size_t chunk_count = 0u;
+    size_t object_count = 0u;
+    uint64_t disk_total = 0u;
+    uint64_t disk_free = 0u;
+    uint8_t payload[NM_STATS_RESP_WIRE_SIZE];
+    nm_status_t status;
+    bool queued;
+
+    if (frame->length != 0u) {
+        return node_fail(connection, NM_ERR_PROTOCOL,
+                         "STATS_REQ payload must be empty");
+    }
+
+    root = nm_store_root(&server->store);
+    if (root != NULL && statvfs(root, &vfs) == 0) {
+        disk_total = (uint64_t)vfs.f_blocks * (uint64_t)vfs.f_frsize;
+        disk_free = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+    } else {
+        nm_log(NM_LOG_WARN, "%s: statvfs failed for %s: %s", server->node_id,
+               root != NULL ? root : "(null)", strerror(errno));
+    }
+
+    status = (nm_status_t)nm_store_list_chunks(&server->store, &hashes,
+                                               &chunk_count);
+    if (status != NM_OK) {
+        nm_log(NM_LOG_WARN, "%s: stats chunk count failed: %s",
+               server->node_id, nm_status_name(status));
+        chunk_count = 0u;
+    }
+    free(hashes);
+
+    status = (nm_status_t)nm_store_list_live_keys(&server->store, &keys,
+                                                  &object_count);
+    if (status != NM_OK) {
+        nm_log(NM_LOG_WARN, "%s: stats object count failed: %s",
+               server->node_id, nm_status_name(status));
+        object_count = 0u;
+    }
+    nm_store_free_keys(keys, object_count);
+
+    nm_put_u64_be(payload + NM_STATS_DISK_TOTAL_OFFSET, disk_total);
+    nm_put_u64_be(payload + NM_STATS_DISK_FREE_OFFSET, disk_free);
+    nm_put_u64_be(payload + NM_STATS_CHUNK_COUNT_OFFSET, (uint64_t)chunk_count);
+    nm_put_u64_be(payload + NM_STATS_OBJECT_COUNT_OFFSET,
+                  (uint64_t)object_count);
+    payload[NM_STATS_STATUS_OFFSET] = (uint8_t)NM_STATS_STATUS_ONLINE;
+
+    queued = node_queue_frame(connection, NM_MSG_STATS_RESP, payload,
+                              NM_STATS_RESP_WIRE_SIZE);
+    return queued ? NODE_DISPATCH_KEEP : NODE_DISPATCH_FATAL;
+}
+
 static node_dispatch_result_t dispatch_frame(node_server_t *server,
                                              node_connection_t *connection,
                                              const nm_frame_t *frame)
@@ -1101,6 +1162,8 @@ static node_dispatch_result_t dispatch_frame(node_server_t *server,
         return handle_list_keys(server, connection, frame);
     case NM_MSG_LIST_OBJECTS_REQ:
         return handle_list_objects(server, connection, frame);
+    case NM_MSG_STATS_REQ:
+        return handle_stats(server, connection, frame);
     case NM_MSG_ACK:
     case NM_MSG_ERROR:
     case NM_MSG_CHUNK:
@@ -1108,6 +1171,7 @@ static node_dispatch_result_t dispatch_frame(node_server_t *server,
     case NM_MSG_SYNC_RESP:
     case NM_MSG_LIST_KEYS_RESP:
     case NM_MSG_LIST_OBJECTS_RESP:
+    case NM_MSG_STATS_RESP:
         return node_fail_and_close(connection, NM_ERR_PROTOCOL,
                                    "unsupported request type");
     default:

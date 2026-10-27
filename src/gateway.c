@@ -32,6 +32,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define GW_MAX_HEADER_COUNT 100u
@@ -39,6 +40,10 @@
 #define GW_HTTP_INPUT_SIZE NM_GATEWAY_INPUT_BUFFER_BYTES
 #define GW_HEADER_SCRATCH (NM_GATEWAY_MAX_HEADER_BYTES + 1u)
 #define GW_MAX_LIST_KEYS 65536u
+#define GW_STATS_TIMEOUT_MS 2000u
+#define GW_ACTIVITY_MAX 50u
+#define GW_ACTIVITY_TYPE_MAX 16u
+#define GW_ACTIVITY_MESSAGE_MAX 192u
 
 typedef struct gw_shared gw_shared_t;
 typedef struct gw_client gw_client_t;
@@ -57,6 +62,8 @@ typedef struct gw_request {
     bool has_content_length;
     bool is_health;
     bool is_list;
+    bool is_cluster_stats;
+    bool is_activity;
     uint64_t content_length;
     char key[NM_MAX_KEY];
 } gw_request_t;
@@ -66,6 +73,13 @@ typedef struct gw_key_list {
     size_t count;
     size_t capacity;
 } gw_key_list_t;
+
+typedef struct gw_activity_event {
+    uint64_t id;
+    uint64_t timestamp_ms;
+    char type[GW_ACTIVITY_TYPE_MAX];
+    char message[GW_ACTIVITY_MESSAGE_MAX];
+} gw_activity_event_t;
 
 struct gw_client {
     int fd;
@@ -85,7 +99,29 @@ struct gw_shared {
     size_t active_clients;
     atomic_bool stopping;
     atomic_uint_fast32_t round_robin;
+    pthread_mutex_t activity_lock;
+    gw_activity_event_t activity[GW_ACTIVITY_MAX];
+    size_t activity_count;
+    size_t activity_next;
+    uint64_t activity_last_id;
+    bool node_status_known[NM_MAX_PEERS];
+    bool node_online[NM_MAX_PEERS];
 };
+
+typedef struct gw_node_stats {
+    char id[NM_MAX_HOST + 16u];
+    bool online;
+    uint64_t disk_total;
+    uint64_t disk_free;
+    uint64_t chunk_count;
+    uint64_t object_count;
+} gw_node_stats_t;
+
+typedef struct gw_stats_request {
+    const gw_shared_t *shared;
+    size_t index;
+    gw_node_stats_t *result;
+} gw_stats_request_t;
 
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -354,6 +390,8 @@ static const char *http_reason(int status)
         return "OK";
     case 201:
         return "Created";
+    case 204:
+        return "No Content";
     case 400:
         return "Bad Request";
     case 404:
@@ -543,6 +581,14 @@ static int resolve_target(const char *target, gw_request_t *request)
         request->is_health = true;
         return 0;
     }
+    if (strcmp(target, "/cluster/stats") == 0) {
+        request->is_cluster_stats = true;
+        return 0;
+    }
+    if (strcmp(target, "/cluster/activity") == 0) {
+        request->is_activity = true;
+        return 0;
+    }
     if (strcmp(target, "/objects") == 0) {
         request->is_list = true;
         return 0;
@@ -708,6 +754,32 @@ static int parse_http_request(char *header, gw_request_t *request)
         }
         if (request->has_content_length && request->content_length != 0u) {
             return 400;
+        }
+        request->expect_continue = false;
+        return 0;
+    }
+    if (request->is_cluster_stats) {
+        if (request->method != GW_METHOD_GET) {
+            return 405;
+        }
+        if (request->has_content_length && request->content_length != 0u) {
+            return 400;
+        }
+        if (expect_seen) {
+            return 417;
+        }
+        request->expect_continue = false;
+        return 0;
+    }
+    if (request->is_activity) {
+        if (request->method != GW_METHOD_GET) {
+            return 405;
+        }
+        if (request->has_content_length && request->content_length != 0u) {
+            return 400;
+        }
+        if (expect_seen) {
+            return 417;
         }
         request->expect_continue = false;
         return 0;
@@ -900,6 +972,28 @@ static int connect_node(const gw_shared_t *shared, size_t index)
     if (nm_fd_set_nonblocking(fd, false) != NM_OK ||
         nm_set_socket_timeouts(fd, shared->options.node_io_timeout_ms,
                                shared->options.node_io_timeout_ms) != NM_OK) {
+        nm_close_fd(&fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int connect_node_with_timeout(const gw_shared_t *shared, size_t index,
+                                     int timeout_ms)
+{
+    int fd;
+
+    if (shared == NULL || timeout_ms <= 0 ||
+        index >= shared->options.node_count) {
+        return -1;
+    }
+    fd = nm_tcp_connect(shared->options.nodes[index].host,
+                        shared->options.nodes[index].port, timeout_ms);
+    if (fd < 0) {
+        return -1;
+    }
+    if (nm_fd_set_nonblocking(fd, false) != NM_OK ||
+        nm_set_socket_timeouts(fd, timeout_ms, timeout_ms) != NM_OK) {
         nm_close_fd(&fd);
         return -1;
     }
@@ -1438,6 +1532,357 @@ static nm_status_t delete_object_on_nodes(gw_shared_t *shared,
     return result;
 }
 
+static void *stats_query_thread(void *argument)
+{
+    gw_stats_request_t *request = argument;
+    nm_frame_t frame;
+    int fd;
+
+    if (request == NULL || request->shared == NULL ||
+        request->result == NULL) {
+        return NULL;
+    }
+    fd = connect_node_with_timeout(request->shared, request->index,
+                                   GW_STATS_TIMEOUT_MS);
+    if (fd < 0) {
+        return NULL;
+    }
+    memset(&frame, 0, sizeof(frame));
+    if (nm_frame_send(fd, NM_MSG_STATS_REQ, NULL, 0u) != NM_OK) {
+        nm_close_fd(&fd);
+        return NULL;
+    }
+    if (nm_frame_recv(fd, &frame) != NM_OK) {
+        nm_close_fd(&fd);
+        return NULL;
+    }
+    nm_close_fd(&fd);
+    if (frame.type != NM_MSG_STATS_RESP || frame.payload == NULL ||
+        frame.length != NM_STATS_RESP_WIRE_SIZE) {
+        nm_frame_free(&frame);
+        return NULL;
+    }
+    if (frame.payload[NM_STATS_STATUS_OFFSET] ==
+        (uint8_t)NM_STATS_STATUS_ONLINE) {
+        request->result->online = true;
+        request->result->disk_total =
+            nm_get_u64_be(frame.payload + NM_STATS_DISK_TOTAL_OFFSET);
+        request->result->disk_free =
+            nm_get_u64_be(frame.payload + NM_STATS_DISK_FREE_OFFSET);
+        request->result->chunk_count =
+            nm_get_u64_be(frame.payload + NM_STATS_CHUNK_COUNT_OFFSET);
+        request->result->object_count =
+            nm_get_u64_be(frame.payload + NM_STATS_OBJECT_COUNT_OFFSET);
+    }
+    nm_frame_free(&frame);
+    return NULL;
+}
+
+static size_t collect_cluster_stats(gw_shared_t *shared,
+                                    gw_node_stats_t *results,
+                                    pthread_t *threads,
+                                    gw_stats_request_t *requests,
+                                    bool *started)
+{
+    size_t count;
+
+    if (shared == NULL || results == NULL || threads == NULL ||
+        requests == NULL || started == NULL) {
+        return 0u;
+    }
+    count = shared->options.node_count;
+    for (size_t i = 0u; i < count; ++i) {
+        int written;
+
+        memset(&results[i], 0, sizeof(results[i]));
+        written = snprintf(results[i].id, sizeof(results[i].id), "%s:%u",
+                           shared->options.nodes[i].host,
+                           (unsigned int)shared->options.nodes[i].port);
+        if (written < 0 || (size_t)written >= sizeof(results[i].id)) {
+            (void)snprintf(results[i].id, sizeof(results[i].id), "node-%zu",
+                           i + 1u);
+        }
+        requests[i].shared = shared;
+        requests[i].index = i;
+        requests[i].result = &results[i];
+        started[i] = pthread_create(&threads[i], NULL, stats_query_thread,
+                                    &requests[i]) == 0;
+    }
+    for (size_t i = 0u; i < count; ++i) {
+        if (started[i]) {
+            (void)pthread_join(threads[i], NULL);
+        }
+    }
+    return count;
+}
+
+static int build_cluster_stats_json(const gw_node_stats_t *nodes,
+                                    size_t count, char **out,
+                                    size_t *out_length)
+{
+    size_t capacity;
+    size_t used = 0u;
+    uint64_t total_objects = 0u;
+    uint64_t total_chunks = 0u;
+    char *json;
+    int written;
+
+    if (nodes == NULL || out == NULL || out_length == NULL) {
+        return NM_ERR_INVALID;
+    }
+    *out = NULL;
+    *out_length = 0u;
+    capacity = 256u + (count * (NM_MAX_HOST + 192u));
+    json = malloc(capacity);
+    if (json == NULL) {
+        return NM_ERR_NOMEM;
+    }
+    written = snprintf(json, capacity, "{\"nodes\":[");
+    if (written < 0 || (size_t)written >= capacity) {
+        free(json);
+        return NM_ERR_TOO_LARGE;
+    }
+    used = (size_t)written;
+    for (size_t i = 0u; i < count; ++i) {
+        uint64_t objects = nodes[i].online ? nodes[i].object_count : 0u;
+        uint64_t chunks = nodes[i].online ? nodes[i].chunk_count : 0u;
+
+        if (objects > total_objects) {
+            total_objects = objects;
+        }
+        if (chunks > total_chunks) {
+            total_chunks = chunks;
+        }
+        written = snprintf(
+            json + used, capacity - used,
+            "%s{\"id\":\"%s\",\"status\":\"%s\",\"disk_total\":%llu,"
+            "\"disk_free\":%llu,\"objects\":%llu}",
+            i == 0u ? "" : ",", nodes[i].id,
+            nodes[i].online ? "online" : "offline",
+            (unsigned long long)(nodes[i].online ? nodes[i].disk_total : 0u),
+            (unsigned long long)(nodes[i].online ? nodes[i].disk_free : 0u),
+            (unsigned long long)objects);
+        if (written < 0 || (size_t)written >= capacity - used) {
+            free(json);
+            return NM_ERR_TOO_LARGE;
+        }
+        used += (size_t)written;
+    }
+    written = snprintf(
+        json + used, capacity - used,
+        "],\"total_objects\":%llu,\"total_chunks\":%llu}",
+        (unsigned long long)total_objects,
+        (unsigned long long)total_chunks);
+    if (written < 0 || (size_t)written >= capacity - used) {
+        free(json);
+        return NM_ERR_TOO_LARGE;
+    }
+    used += (size_t)written;
+    *out = json;
+    *out_length = used;
+    return NM_OK;
+}
+
+static uint64_t gateway_wall_ms(void)
+{
+    struct timespec timestamp;
+
+    if (clock_gettime(CLOCK_REALTIME, &timestamp) != 0 ||
+        timestamp.tv_sec < 0) {
+        return 0u;
+    }
+    return (uint64_t)timestamp.tv_sec * 1000u +
+           (uint64_t)(timestamp.tv_nsec / 1000000L);
+}
+
+static void gateway_activity_append_locked(gw_shared_t *shared,
+                                           const char *type,
+                                           const char *message)
+{
+    gw_activity_event_t *event;
+
+    if (shared == NULL || type == NULL || message == NULL) {
+        return;
+    }
+    event = &shared->activity[shared->activity_next];
+    shared->activity_last_id += 1u;
+    event->id = shared->activity_last_id;
+    event->timestamp_ms = gateway_wall_ms();
+    (void)snprintf(event->type, sizeof(event->type), "%s", type);
+    (void)snprintf(event->message, sizeof(event->message), "%s", message);
+    shared->activity_next =
+        (shared->activity_next + 1u) % GW_ACTIVITY_MAX;
+    if (shared->activity_count < GW_ACTIVITY_MAX) {
+        shared->activity_count += 1u;
+    }
+}
+
+static void gateway_record_activity(gw_shared_t *shared, const char *type,
+                                    const char *message)
+{
+    if (shared == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&shared->activity_lock);
+    gateway_activity_append_locked(shared, type, message);
+    pthread_mutex_unlock(&shared->activity_lock);
+}
+
+static void gateway_note_node_status(gw_shared_t *shared,
+                                     const gw_node_stats_t *results,
+                                     size_t count)
+{
+    char message[GW_ACTIVITY_MESSAGE_MAX];
+
+    if (shared == NULL || results == NULL) {
+        return;
+    }
+    if (count > NM_MAX_PEERS) {
+        count = NM_MAX_PEERS;
+    }
+    pthread_mutex_lock(&shared->activity_lock);
+    for (size_t i = 0u; i < count; ++i) {
+        bool online = results[i].online;
+
+        if (shared->node_status_known[i] &&
+            shared->node_online[i] != online) {
+            (void)snprintf(message, sizeof(message), "Node %.128s is %s",
+                           results[i].id, online ? "online" : "offline");
+            gateway_activity_append_locked(
+                shared, online ? "node_online" : "node_offline", message);
+        }
+        shared->node_status_known[i] = true;
+        shared->node_online[i] = online;
+    }
+    pthread_mutex_unlock(&shared->activity_lock);
+}
+
+static int build_activity_json(gw_shared_t *shared, char **out,
+                               size_t *out_length)
+{
+    size_t capacity;
+    size_t used = 0u;
+    char *json;
+    int written;
+
+    if (shared == NULL || out == NULL || out_length == NULL) {
+        return NM_ERR_INVALID;
+    }
+    *out = NULL;
+    *out_length = 0u;
+    pthread_mutex_lock(&shared->activity_lock);
+    capacity = 32u + shared->activity_count *
+                         (GW_ACTIVITY_MESSAGE_MAX + 128u);
+    json = malloc(capacity);
+    if (json == NULL) {
+        pthread_mutex_unlock(&shared->activity_lock);
+        return NM_ERR_NOMEM;
+    }
+    written = snprintf(json, capacity, "{\"events\":[");
+    if (written < 0 || (size_t)written >= capacity) {
+        free(json);
+        pthread_mutex_unlock(&shared->activity_lock);
+        return NM_ERR_TOO_LARGE;
+    }
+    used = (size_t)written;
+    for (size_t n = 0u; n < shared->activity_count; ++n) {
+        size_t index =
+            (shared->activity_next + GW_ACTIVITY_MAX - 1u - n) %
+            GW_ACTIVITY_MAX;
+        const gw_activity_event_t *event = &shared->activity[index];
+
+        written = snprintf(
+            json + used, capacity - used,
+            "%s{\"id\":%llu,\"type\":\"%s\",\"message\":\"%s\","
+            "\"timestamp\":%llu}",
+            n == 0u ? "" : ",", (unsigned long long)event->id, event->type,
+            event->message, (unsigned long long)event->timestamp_ms);
+        if (written < 0 || (size_t)written >= capacity - used) {
+            free(json);
+            pthread_mutex_unlock(&shared->activity_lock);
+            return NM_ERR_TOO_LARGE;
+        }
+        used += (size_t)written;
+    }
+    written = snprintf(json + used, capacity - used, "]}");
+    if (written < 0 || (size_t)written >= capacity - used) {
+        free(json);
+        pthread_mutex_unlock(&shared->activity_lock);
+        return NM_ERR_TOO_LARGE;
+    }
+    used += (size_t)written;
+    pthread_mutex_unlock(&shared->activity_lock);
+    *out = json;
+    *out_length = used;
+    return NM_OK;
+}
+
+static bool handle_activity(gw_shared_t *shared, gw_client_t *client,
+                            const gw_request_t *request)
+{
+    char *json = NULL;
+    size_t json_length = 0u;
+    bool keep_alive;
+    bool sent;
+    int result;
+
+    if (shared == NULL || client == NULL || request == NULL) {
+        return false;
+    }
+    keep_alive = request->keep_alive && !atomic_load(&shared->stopping);
+    result = build_activity_json(shared, &json, &json_length);
+    if (result != NM_OK) {
+        (void)send_error(client, 500);
+        return false;
+    }
+    sent = send_response_head(client, 200, "application/json", json_length,
+                              keep_alive, "");
+    if (sent) {
+        sent = send_all(client->fd, json, json_length);
+    }
+    free(json);
+    return sent && keep_alive;
+}
+
+static bool handle_cluster_stats(gw_shared_t *shared, gw_client_t *client,
+                                 const gw_request_t *request)
+{
+    gw_node_stats_t results[NM_MAX_PEERS];
+    gw_stats_request_t requests[NM_MAX_PEERS];
+    pthread_t threads[NM_MAX_PEERS];
+    bool started[NM_MAX_PEERS];
+    char *json = NULL;
+    size_t json_length = 0u;
+    size_t count;
+    bool keep_alive;
+    bool sent;
+    int result;
+
+    if (shared == NULL || client == NULL || request == NULL) {
+        return false;
+    }
+    keep_alive = request->keep_alive && !atomic_load(&shared->stopping);
+    memset(results, 0, sizeof(results));
+    memset(requests, 0, sizeof(requests));
+    memset(threads, 0, sizeof(threads));
+    memset(started, 0, sizeof(started));
+
+    count = collect_cluster_stats(shared, results, threads, requests, started);
+    gateway_note_node_status(shared, results, count);
+    result = build_cluster_stats_json(results, count, &json, &json_length);
+    if (result != NM_OK) {
+        (void)send_error(client, 500);
+        return false;
+    }
+    sent = send_response_head(client, 200, "application/json", json_length,
+                              keep_alive, "");
+    if (sent) {
+        sent = send_all(client->fd, json, json_length);
+    }
+    free(json);
+    return sent && keep_alive;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Request handlers                                                          */
 /* ------------------------------------------------------------------------- */
@@ -1469,9 +1914,10 @@ static bool handle_get(gw_shared_t *shared, gw_client_t *client,
 {
     nm_manifest_t manifest;
     bool keep_alive = request->keep_alive && !atomic_load(&shared->stopping);
-    char etag_headers[160];
+    char response_headers[512];
     char etag_hex[NM_SHA256_HEX_LEN + 1u];
     nm_status_t status;
+    int header_length;
 
     memset(&manifest, 0, sizeof(manifest));
     status = fetch_manifest_from_nodes(shared, request->key, &manifest);
@@ -1491,12 +1937,20 @@ static bool handle_get(gw_shared_t *shared, gw_client_t *client,
         return false;
     }
     nm_sha256_to_hex(manifest.object_hash, etag_hex);
-    (void)snprintf(etag_headers, sizeof(etag_headers),
-                   "ETag: \"%s\"\r\nX-Content-SHA256: %s\r\n", etag_hex,
-                   etag_hex);
+    header_length = snprintf(
+        response_headers, sizeof(response_headers),
+        "ETag: \"%s\"\r\nX-Content-SHA256: %s\r\n"
+        "Content-Disposition: attachment; filename=\"%s\"\r\n",
+        etag_hex, etag_hex, request->key);
+    if (header_length < 0 ||
+        (size_t)header_length >= sizeof(response_headers)) {
+        nm_manifest_free(&manifest);
+        (void)send_error(client, 500);
+        return false;
+    }
     if (!send_response_head(client, 200, "application/octet-stream",
                             manifest.total_size, keep_alive,
-                            etag_headers)) {
+                            response_headers)) {
         nm_manifest_free(&manifest);
         return false;
     }
@@ -1520,6 +1974,13 @@ static bool handle_get(gw_shared_t *shared, gw_client_t *client,
             return false;
         }
         free(data);
+    }
+    {
+        char activity[GW_ACTIVITY_MESSAGE_MAX];
+        (void)snprintf(activity, sizeof(activity),
+                       "Object %s downloaded (%llu bytes)", request->key,
+                       (unsigned long long)manifest.total_size);
+        gateway_record_activity(shared, "download", activity);
     }
     nm_manifest_free(&manifest);
     return keep_alive;
@@ -1634,6 +2095,13 @@ static bool handle_put(gw_shared_t *shared, gw_client_t *client,
         goto cleanup;
     }
     nm_close_fd(&node_fd);
+    {
+        char activity[GW_ACTIVITY_MESSAGE_MAX];
+        (void)snprintf(activity, sizeof(activity),
+                       "Object %s uploaded (%llu bytes)", request->key,
+                       (unsigned long long)request->content_length);
+        gateway_record_activity(shared, "upload", activity);
+    }
     nm_sha256_to_hex(object_hash, sha_hex);
     (void)snprintf(etag_headers, sizeof(etag_headers),
                    "ETag: \"%s\"\r\n", sha_hex);
@@ -1715,6 +2183,12 @@ static bool handle_delete(gw_shared_t *shared, gw_client_t *client,
         (void)send_error(client, http_status_for(status));
         return false;
     }
+    {
+        char activity[GW_ACTIVITY_MESSAGE_MAX];
+        (void)snprintf(activity, sizeof(activity), "Object %s deleted",
+                       request->key);
+        gateway_record_activity(shared, "delete", activity);
+    }
     if (!send_response_head(client, 204, "text/plain", 0u, keep_alive, "")) {
         return false;
     }
@@ -1784,6 +2258,10 @@ static void *client_worker(void *argument)
             keep_alive = handle_options(shared, client, &request);
         } else if (request.is_health) {
             keep_alive = handle_health(shared, client, &request);
+        } else if (request.is_cluster_stats) {
+            keep_alive = handle_cluster_stats(shared, client, &request);
+        } else if (request.is_activity) {
+            keep_alive = handle_activity(shared, client, &request);
         } else if (request.is_list) {
             keep_alive = handle_list_objects(shared, client, &request);
         } else if (request.method == GW_METHOD_GET) {
@@ -1872,10 +2350,16 @@ int nm_gateway_run(const nm_gateway_options_t *options)
     if (pthread_mutex_init(&shared.lock, NULL) != 0) {
         return EXIT_FAILURE;
     }
-    if (pthread_cond_init(&shared.condition, NULL) != 0) {
+    if (pthread_mutex_init(&shared.activity_lock, NULL) != 0) {
         pthread_mutex_destroy(&shared.lock);
         return EXIT_FAILURE;
     }
+    if (pthread_cond_init(&shared.condition, NULL) != 0) {
+        pthread_mutex_destroy(&shared.activity_lock);
+        pthread_mutex_destroy(&shared.lock);
+        return EXIT_FAILURE;
+    }
+    gateway_record_activity(&shared, "gateway_started", "Gateway started");
     if (install_signal_handlers() != 0) {
         nm_log(NM_LOG_ERROR, "gateway: cannot install signal handlers: %s",
                strerror(errno));
@@ -1976,6 +2460,7 @@ int nm_gateway_run(const nm_gateway_options_t *options)
 cleanup_sync:
     nm_close_fd(&shared.listen_fd);
     pthread_cond_destroy(&shared.condition);
+    pthread_mutex_destroy(&shared.activity_lock);
     pthread_mutex_destroy(&shared.lock);
     return result;
 }
