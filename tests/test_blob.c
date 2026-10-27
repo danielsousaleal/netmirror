@@ -476,6 +476,72 @@ static void test_manifest_roundtrip(nm_store_t *store)
     CHECK(!directory_has_prefix(nm_store_objects_dir(store), ".nm-tmp-"));
 }
 
+static void test_large_manifest_roundtrip(void)
+{
+    char key[NM_MAX_KEY];
+    const uint64_t total_size = (uint64_t)NM_MAX_CHUNKS * NM_CHUNK_SIZE;
+    nm_manifest_t manifest;
+    nm_manifest_t decoded;
+    uint8_t *serialized = NULL;
+    size_t serialized_length = 0u;
+    size_t expected_length;
+
+    memset(key, 'k', NM_MAX_KEY_LEN);
+    key[NM_MAX_KEY_LEN] = '\0';
+    memset(&manifest, 0, sizeof(manifest));
+    memset(&decoded, 0, sizeof(decoded));
+
+    CHECK(NM_MAX_OBJECT_SIZE == total_size);
+    CHECK(NM_MAX_CHUNKS <= UINT32_MAX);
+
+    CHECK_STATUS(nm_manifest_init(&manifest, key, total_size), NM_OK);
+    CHECK(manifest.chunk_count == NM_MAX_CHUNKS);
+    CHECK(manifest.chunk_hashes != NULL);
+    if (manifest.chunk_hashes != NULL) {
+        for (uint32_t i = 0u; i < manifest.chunk_count; ++i) {
+            uint8_t *hash =
+                manifest.chunk_hashes + ((size_t)i * NM_SHA256_LEN);
+            memset(hash, (int)(i & 0xffu), NM_SHA256_LEN);
+            hash[1] = (uint8_t)((i >> 8u) & 0xffu);
+            hash[2] = (uint8_t)((i >> 16u) & 0xffu);
+        }
+    }
+    memset(manifest.object_hash, 0x5a, NM_SHA256_LEN);
+    CHECK_STATUS(nm_manifest_validate(&manifest), NM_OK);
+
+    expected_length = NM_MANIFEST_FIXED_HEADER_SIZE + strlen(key) +
+                      NM_MANIFEST_FIXED_TRAILER_SIZE +
+                      ((size_t)NM_MAX_CHUNKS * NM_SHA256_LEN);
+    CHECK(expected_length == NM_MAX_MANIFEST_SIZE);
+    CHECK_STATUS(nm_manifest_serialize(&manifest, &serialized,
+                                       &serialized_length),
+                 NM_OK);
+    CHECK(serialized != NULL);
+    CHECK(serialized_length == expected_length);
+    CHECK(serialized_length == NM_MAX_MANIFEST_SIZE);
+    CHECK(NM_MAX_MANIFEST_SIZE <= NM_MAX_FRAME_PAYLOAD);
+
+    if (serialized != NULL) {
+        CHECK_STATUS(nm_manifest_deserialize(serialized, serialized_length,
+                                             &decoded),
+                     NM_OK);
+        CHECK(manifest_equal(&manifest, &decoded));
+        CHECK(decoded.chunk_hashes != NULL);
+        if (decoded.chunk_hashes != NULL) {
+            CHECK(memcmp(decoded.chunk_hashes, manifest.chunk_hashes,
+                         (size_t)NM_MAX_CHUNKS * NM_SHA256_LEN) == 0);
+        }
+    }
+
+    nm_manifest_free(&decoded);
+    nm_manifest_free(&manifest);
+    free(serialized);
+
+    CHECK_STATUS(nm_manifest_init(&manifest, "over-limit", total_size + 1u),
+                 NM_ERR_TOO_LARGE);
+    nm_manifest_free(&manifest);
+}
+
 static void test_empty_and_invalid_manifests(nm_store_t *store)
 {
     static const char empty_hex[] =
@@ -681,6 +747,7 @@ int main(void)
 
     test_chunk_store(&store_one);
     test_manifest_roundtrip(&store_one);
+    test_large_manifest_roundtrip();
     test_empty_and_invalid_manifests(&store_one);
     test_file_ingest(&store_two, temporary);
     test_key_listing(&store_two);

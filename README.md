@@ -133,7 +133,7 @@ Successful `PUT` responses are JSON:
 - `Expect: 100-continue` is supported.
 - `Connection: keep-alive` and bounded HTTP pipelining are supported.
 - `Transfer-Encoding: chunked` is **not** supported (`501`).
-- Maximum object size is **16 GiB** (4096 chunks of 4 MiB).
+- Maximum object size is **4 TiB** (1,048,576 chunks of 4 MiB).
 - There is no `DELETE`, no object listing endpoint, and no `Range` support.
 
 Errors are JSON and use conventional status codes: `400`, `404`, `405`, `408`,
@@ -156,9 +156,12 @@ deduplicated within a node:
 ```
 
 The manifest is the commit marker. It records the key, total size, update
-timestamp, whole-object SHA-256, and the ordered list of chunk digests. Chunks
-are written first; the manifest is written last. A crash can therefore leave
-orphan chunks, but never a manifest that points to missing data.
+timestamp, whole-object SHA-256, and the ordered list of chunk digests. The
+chunk-hash vector is allocated dynamically from `chunk_count` with
+`calloc`/`malloc` and freed with `nm_manifest_free()`; there is no fixed-size
+hash array in the struct. Chunks are written first; the manifest is written
+last. A crash can therefore leave orphan chunks, but never a manifest that
+points to missing data.
 
 Writes are atomic: data goes to a temporary file in the same directory, is
 `fsync`'ed, `rename`'d into place, and the parent directory is `fsync`'ed.
@@ -175,7 +178,7 @@ Manifest wire format (version 1):
 | key           | n B         | no NUL terminator                      |
 | total_size    | 8 B, BE     | object length in bytes                 |
 | updated_ms    | 8 B, BE     | Unix epoch milliseconds                |
-| chunk_count   | 4 B, BE     | 0-4096                                 |
+| chunk_count   | 4 B, BE     | 0-1,048,576                            |
 | object_hash   | 32 B        | SHA-256 of the complete object         |
 | chunk_hashes  | 32 x c B    | chunk digests in object order          |
 
@@ -430,8 +433,17 @@ limitations are deliberate:
 - **No external listing or deletion.** Keys are known by their writers. There
   is no consistency guarantee across a listing because no listing endpoint
   exists.
-- **Fixed maximums.** Objects are limited to 16 GiB (4096 chunks of 4 MiB), and
-  keys to 127 characters.
+- **Large manifests are one frame.** At the 4 TiB ceiling a manifest carries
+  1,048,576 digests (~32 MiB) and must fit in a single frame.
+  `NM_MAX_FRAME_PAYLOAD` and the per-connection parser buffer are sized for it,
+  which increases memory pressure on nodes and requires the manifest RPC to
+  finish within the configured timeouts; tune those limits for slower links.
+- **Chunk size is part of the storage contract.** `NM_CHUNK_SIZE` is compiled
+  in and is not stored in manifests. Changing it changes every chunk boundary
+  and digest, so existing manifests become unreadable without a version bump
+  and migration.
+- **Fixed maximums.** Objects are limited to 4 TiB (1,048,576 chunks of 4 MiB),
+  and keys to 127 characters.
 
 ## License
 

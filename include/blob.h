@@ -134,7 +134,8 @@ int nm_store_list_chunks(const nm_store_t *store,
 /* ------------------------------------------------------------------------- */
 
 /*
- * Initialize a manifest and allocate its chunk hash array. total_size must be
+ * Initialize a manifest and allocate its dynamically sized chunk hash array
+ * (chunk_count * NM_SHA256_LEN bytes). total_size must be
  * <= NM_MAX_OBJECT_SIZE; chunk_count is derived (zero for an empty object).
  * object_hash starts as zero bytes and updated_ms is set to now. The caller
  * fills object_hash and each chunk hash, then validates/persists the manifest.

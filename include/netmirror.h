@@ -62,7 +62,7 @@
  *   8       n     key bytes (UTF-8, no NUL)
  *   8+n     8     total_size (BE)
  *   16+n    8     updated_ms (BE, Unix epoch milliseconds)
- *   24+n    4     chunk_count (BE, 0..NM_MAX_OBJECT_CHUNKS)
+ *   24+n    4     chunk_count (BE, 0..NM_MAX_CHUNKS)
  *   28+n    32    SHA-256 of the complete object
  *   60+n    32*c  chunk digests, in object order
  *
@@ -100,10 +100,18 @@ extern "C" {
 #define NM_PROJECT_NAME "netmirror"
 #define NM_PROTOCOL_VERSION 1u
 
-/* Chunks are 4 MiB. Object limits are constants to make wire sizing exact. */
+/*
+ * Chunk size is a protocol constant, not a per-object field. Changing it
+ * changes chunk boundaries and therefore every chunk digest and manifest.
+ * Existing manifests do not record the chunk size, so a change requires a
+ * manifest/protocol version bump and a data migration.
+ *
+ * 1,048,576 chunks of 4 MiB = 4 TiB. The manifest stores chunk_count as a
+ * uint32_t, and its hash vector is allocated dynamically from that count.
+ */
 #define NM_CHUNK_SIZE (4u * 1024u * 1024u)
-#define NM_MAX_OBJECT_CHUNKS 4096u
-#define NM_MAX_OBJECT_SIZE ((uint64_t)NM_CHUNK_SIZE * NM_MAX_OBJECT_CHUNKS)
+#define NM_MAX_CHUNKS (1u << 20)
+#define NM_MAX_OBJECT_SIZE ((uint64_t)NM_CHUNK_SIZE * NM_MAX_CHUNKS)
 
 #define NM_SHA256_LEN 32u
 #define NM_SHA256_HEX_LEN (NM_SHA256_LEN * 2u)
@@ -120,7 +128,6 @@ extern "C" {
 
 /* 9-byte framing header: 1-byte type + 8-byte big-endian payload length. */
 #define NM_FRAME_HEADER_SIZE 9u
-#define NM_MAX_FRAME_PAYLOAD (NM_CHUNK_SIZE + 4096u)
 
 /* Manifest constants. Keep these in sync with the format documented above. */
 #define NM_MANIFEST_MAGIC 0x4E4D4F42u
@@ -130,7 +137,20 @@ extern "C" {
 #define NM_MAX_MANIFEST_SIZE                                                   \
     (NM_MANIFEST_FIXED_HEADER_SIZE + NM_MAX_KEY_LEN +                          \
      NM_MANIFEST_FIXED_TRAILER_SIZE +                                          \
-     (NM_MAX_OBJECT_CHUNKS * NM_SHA256_LEN))
+     (NM_MAX_CHUNKS * NM_SHA256_LEN))
+
+/*
+ * Largest frame payload. A fully populated manifest is larger than a chunk
+ * frame: NM_MAX_CHUNKS hashes occupy ~32 MiB, while a chunk frame is
+ * NM_SHA256_LEN + NM_CHUNK_SIZE. The parser and every socket path enforce
+ * this ceiling, so raising NM_MAX_CHUNKS also raises the per-connection
+ * parser buffer limit.
+ */
+#define NM_MAX_CHUNK_PAYLOAD (NM_SHA256_LEN + NM_CHUNK_SIZE)
+#define NM_MAX_FRAME_PAYLOAD                                                   \
+    (NM_MAX_MANIFEST_SIZE > NM_MAX_CHUNK_PAYLOAD                               \
+         ? NM_MAX_MANIFEST_SIZE                                                \
+         : NM_MAX_CHUNK_PAYLOAD)
 
 /* Exact ACK payload layout. */
 #define NM_ACK_WIRE_SIZE (1u + 1u + NM_SHA256_LEN)
@@ -233,10 +253,11 @@ typedef struct nm_endpoint {
 } nm_endpoint_t;
 
 /*
- * Deserialized object manifest. `key` is NUL-terminated; `chunk_hashes`
- * holds exactly chunk_count SHA-256 digests in object order and may be NULL
- * only when chunk_count is zero. Use the manifest helpers in blob.h to
- * allocate and free it.
+ * Deserialized object manifest. `key` is NUL-terminated. `chunk_hashes` is a
+ * dynamically allocated array of exactly chunk_count * NM_SHA256_LEN bytes in
+ * object order; it is never a fixed-size inline array and may be NULL only
+ * when chunk_count is zero. Use the manifest helpers in blob.h to allocate
+ * and free it.
  */
 typedef struct nm_manifest {
     char key[NM_MAX_KEY];
@@ -260,9 +281,12 @@ static inline uint32_t nm_quorum_size(uint32_t replicas)
 }
 
 _Static_assert(NM_FRAME_HEADER_SIZE == 9u, "frame header must be 9 bytes");
-_Static_assert(NM_CHUNK_SIZE == 4194304u, "chunk size must be exactly 4 MiB");
+_Static_assert(NM_MAX_CHUNKS <= UINT32_MAX,
+               "manifest chunk_count is a uint32_t");
 _Static_assert(NM_MAX_MANIFEST_SIZE <= NM_MAX_FRAME_PAYLOAD,
                "a manifest must fit in one frame payload");
+_Static_assert(NM_MAX_CHUNK_PAYLOAD <= NM_MAX_FRAME_PAYLOAD,
+               "a chunk frame must fit in one frame payload");
 _Static_assert((NM_SHA256_LEN * 8u) == 256u, "SHA-256 is 256 bits");
 _Static_assert(NM_MAX_KEY >= 2u, "object keys need at least one character");
 

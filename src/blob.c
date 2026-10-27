@@ -836,7 +836,7 @@ static int expected_chunk_count(uint64_t total_size, uint32_t *out)
         chunks = (total_size + (uint64_t)NM_CHUNK_SIZE - 1u) /
                  (uint64_t)NM_CHUNK_SIZE;
     }
-    if (chunks > NM_MAX_OBJECT_CHUNKS) {
+    if (chunks > NM_MAX_CHUNKS) {
         return NM_ERR_TOO_LARGE;
     }
     *out = (uint32_t)chunks;
@@ -865,6 +865,10 @@ int nm_manifest_init(nm_manifest_t *manifest, const char *key,
         return result;
     }
     if (expected > 0u) {
+        /*
+         * Allocate exactly chunk_count digests. There is no fixed-size array
+         * in nm_manifest_t; the manifest owns this buffer until free.
+         */
         hashes = calloc((size_t)expected, NM_SHA256_LEN);
         if (hashes == NULL) {
             return NM_ERR_NOMEM;
@@ -1407,7 +1411,7 @@ int nm_store_put_file(nm_store_t *store, const char *source_path,
             result = NM_ERR_TOO_LARGE;
             goto cleanup;
         }
-        if (hash_count >= NM_MAX_OBJECT_CHUNKS) {
+        if (hash_count >= NM_MAX_CHUNKS) {
             result = NM_ERR_TOO_LARGE;
             goto cleanup;
         }

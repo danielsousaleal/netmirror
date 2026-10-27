@@ -400,7 +400,8 @@ static int command_put(const char *path, const char *url_text,
         goto cleanup;
     }
     if ((uint64_t)st.st_size > NM_MAX_OBJECT_SIZE) {
-        (void)fprintf(stderr, "netmirror: object exceeds 16 GiB limit\n");
+        (void)fprintf(stderr, "netmirror: object exceeds %llu-byte limit\n",
+                      (unsigned long long)NM_MAX_OBJECT_SIZE);
         goto cleanup;
     }
     buffer = malloc(CLI_COPY_BUFFER);

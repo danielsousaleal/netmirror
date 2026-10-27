@@ -50,10 +50,15 @@ extern "C" {
 #define NM_CLUSTER_DEFAULT_HEARTBEAT_INTERVAL_MS 1000u
 #define NM_CLUSTER_DEFAULT_HEARTBEAT_TIMEOUT_MS 3000u
 #define NM_CLUSTER_DEFAULT_ANTI_ENTROPY_INTERVAL_MS 15000u
-#define NM_CLUSTER_DEFAULT_MAX_PEER_QUEUE_BYTES (12u * 1024u * 1024u)
+/*
+ * A max-size manifest frame is much larger than a chunk frame. Leave room for
+ * one manifest frame plus one chunk frame; the hard cap stays at 64 MiB.
+ */
+#define NM_CLUSTER_MAX_PEER_QUEUE_BYTES (64u * 1024u * 1024u)
+#define NM_CLUSTER_DEFAULT_MAX_PEER_QUEUE_BYTES \
+    (NM_MAX_FRAME_PAYLOAD + NM_CHUNK_SIZE + NM_FRAME_HEADER_SIZE)
 #define NM_CLUSTER_DEFAULT_MAX_PEER_REQUESTS 8u
 #define NM_CLUSTER_DEFAULT_SYNC_BATCH 128u
-#define NM_CLUSTER_MAX_PEER_QUEUE_BYTES (64u * 1024u * 1024u)
 #define NM_CLUSTER_MAX_PEER_REQUESTS 64u
 
 typedef struct nm_cluster nm_cluster_t;
