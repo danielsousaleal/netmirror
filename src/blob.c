@@ -883,6 +883,22 @@ int nm_manifest_init(nm_manifest_t *manifest, const char *key,
     return NM_OK;
 }
 
+int nm_manifest_init_tombstone(nm_manifest_t *manifest, const char *key,
+                               uint64_t deleted_ms)
+{
+    size_t key_length;
+
+    if (manifest == NULL || !nm_key_is_valid(key) || deleted_ms == 0u) {
+        return NM_ERR_INVALID;
+    }
+    memset(manifest, 0, sizeof(*manifest));
+    key_length = strlen(key);
+    memcpy(manifest->key, key, key_length + 1u);
+    manifest->updated_ms = deleted_ms;
+    manifest->deleted = true;
+    return nm_manifest_validate(manifest);
+}
+
 void nm_manifest_free(nm_manifest_t *manifest)
 {
     if (manifest == NULL) {
@@ -906,6 +922,13 @@ int nm_manifest_validate(const nm_manifest_t *manifest)
     }
     if (!nm_key_is_valid(manifest->key)) {
         return NM_ERR_INVALID;
+    }
+    if (manifest->deleted) {
+        if (manifest->total_size != 0u || manifest->chunk_count != 0u ||
+            manifest->chunk_hashes != NULL || manifest->updated_ms == 0u) {
+            return NM_ERR_INVALID;
+        }
+        return NM_OK;
     }
     if (expected_chunk_count(manifest->total_size, &expected) != NM_OK) {
         return NM_ERR_INVALID;
@@ -973,7 +996,7 @@ int nm_manifest_serialize(const nm_manifest_t *manifest, uint8_t **out,
 
     put_u32_be(buffer, NM_MANIFEST_MAGIC);
     buffer[4] = (uint8_t)NM_MANIFEST_VERSION;
-    buffer[5] = 0u;
+    buffer[5] = manifest->deleted ? (uint8_t)NM_MANIFEST_FLAG_DELETED : 0u;
     put_u16_be(buffer + 6, (uint16_t)key_length);
     memcpy(buffer + 8, manifest->key, key_length);
 
@@ -1006,7 +1029,8 @@ int nm_manifest_deserialize(const uint8_t *data, size_t length,
 {
     nm_manifest_t parsed;
     uint32_t version;
-    uint32_t reserved;
+    uint8_t flags;
+    bool deleted;
     uint16_t key_length;
     uint32_t chunk_count;
     uint32_t expected;
@@ -1026,9 +1050,11 @@ int nm_manifest_deserialize(const uint8_t *data, size_t length,
         return NM_ERR_PROTOCOL;
     }
     version = data[4];
-    reserved = data[5];
+    flags = data[5];
+    deleted = (flags & NM_MANIFEST_FLAG_DELETED) != 0u;
     key_length = get_u16_be(data + 6);
-    if (version != NM_MANIFEST_VERSION || reserved != 0u ||
+    if (version != NM_MANIFEST_VERSION ||
+        (flags & (uint8_t)~NM_MANIFEST_FLAG_DELETED) != 0u ||
         key_length == 0u || key_length > NM_MAX_KEY_LEN) {
         return NM_ERR_PROTOCOL;
     }
@@ -1040,6 +1066,10 @@ int nm_manifest_deserialize(const uint8_t *data, size_t length,
     total_size = get_u64_be(data + 8u + key_length);
     updated_ms = get_u64_be(data + 16u + key_length);
     chunk_count = get_u32_be(data + 24u + key_length);
+    if (deleted &&
+        (total_size != 0u || chunk_count != 0u || updated_ms == 0u)) {
+        return NM_ERR_PROTOCOL;
+    }
     if (expected_chunk_count(total_size, &expected) != NM_OK ||
         chunk_count != expected) {
         return NM_ERR_PROTOCOL;
@@ -1061,7 +1091,7 @@ int nm_manifest_deserialize(const uint8_t *data, size_t length,
     if (!nm_key_is_valid(parsed.key)) {
         return NM_ERR_PROTOCOL;
     }
-    if (hash_is_all_zero(data + 28u + key_length)) {
+    if (!deleted && hash_is_all_zero(data + 28u + key_length)) {
         return NM_ERR_PROTOCOL;
     }
     memcpy(parsed.object_hash, data + 28u + key_length, NM_SHA256_LEN);
@@ -1076,6 +1106,7 @@ int nm_manifest_deserialize(const uint8_t *data, size_t length,
     parsed.total_size = total_size;
     parsed.updated_ms = updated_ms;
     parsed.chunk_count = chunk_count;
+    parsed.deleted = deleted;
     parsed.chunk_hashes = hashes;
     *out = parsed;
     return NM_OK;
@@ -1239,7 +1270,8 @@ static int key_vector_append(char ***keys, size_t *count, size_t *capacity,
     return NM_OK;
 }
 
-int nm_store_list_keys(const nm_store_t *store, char ***keys, size_t *count)
+static int store_list_keys_impl(const nm_store_t *store, bool include_deleted,
+                                char ***keys, size_t *count)
 {
     DIR *directory = NULL;
     char **result_keys = NULL;
@@ -1301,6 +1333,10 @@ int nm_store_list_keys(const nm_store_t *store, char ***keys, size_t *count)
             /* Ignore unreadable/corrupt manifest files during discovery. */
             continue;
         }
+        if (!include_deleted && manifest.deleted) {
+            nm_manifest_free(&manifest);
+            continue;
+        }
         result = key_vector_append(&result_keys, &result_count,
                                    &result_capacity, manifest.key);
         nm_manifest_free(&manifest);
@@ -1325,6 +1361,17 @@ int nm_store_list_keys(const nm_store_t *store, char ***keys, size_t *count)
     return NM_OK;
 }
 
+int nm_store_list_keys(const nm_store_t *store, char ***keys, size_t *count)
+{
+    return store_list_keys_impl(store, true, keys, count);
+}
+
+int nm_store_list_live_keys(const nm_store_t *store, char ***keys,
+                            size_t *count)
+{
+    return store_list_keys_impl(store, false, keys, count);
+}
+
 void nm_store_free_keys(char **keys, size_t count)
 {
     if (keys == NULL) {
@@ -1334,6 +1381,242 @@ void nm_store_free_keys(char **keys, size_t count)
         free(keys[i]);
     }
     free(keys);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Deletion and tombstones                                                   */
+/* ------------------------------------------------------------------------- */
+
+static int delete_chunk_file(const nm_store_t *store,
+                             const uint8_t hash[NM_SHA256_LEN])
+{
+    char path[NM_PATH_MAX];
+    int result;
+
+    result = chunk_path(store, hash, path);
+    if (result != NM_OK) {
+        return result;
+    }
+    if (unlink(path) != 0) {
+        return errno == ENOENT ? NM_ERR_NOT_FOUND : NM_ERR_IO;
+    }
+    return NM_OK;
+}
+
+static size_t sort_unique_hashes(uint8_t *hashes, size_t count)
+{
+    size_t unique = 0u;
+
+    if (count == 0u) {
+        return 0u;
+    }
+    qsort(hashes, count, NM_SHA256_LEN, compare_hashes);
+    unique = 1u;
+    for (size_t i = 1u; i < count; ++i) {
+        const uint8_t *candidate = hashes + (i * NM_SHA256_LEN);
+        const uint8_t *previous = hashes + ((unique - 1u) * NM_SHA256_LEN);
+        if (memcmp(candidate, previous, NM_SHA256_LEN) != 0) {
+            if (unique != i) {
+                memmove(hashes + (unique * NM_SHA256_LEN), candidate,
+                        NM_SHA256_LEN);
+            }
+            unique += 1u;
+        }
+    }
+    return unique;
+}
+
+static bool find_hash_index(const uint8_t *hashes, size_t count,
+                            const uint8_t *hash, size_t *index)
+{
+    size_t low = 0u;
+    size_t high = count;
+
+    while (low < high) {
+        size_t middle = low + ((high - low) / 2u);
+        int comparison = memcmp(hash, hashes + (middle * NM_SHA256_LEN),
+                                NM_SHA256_LEN);
+        if (comparison == 0) {
+            *index = middle;
+            return true;
+        }
+        if (comparison < 0) {
+            high = middle;
+        } else {
+            low = middle + 1u;
+        }
+    }
+    return false;
+}
+
+/*
+ * Remove chunks referenced by a manifest that is being tombstoned when no
+ * other live manifest references them. The tombstone must already be written
+ * so the deleted key is excluded from the live-key scan. This is best effort:
+ * allocation or filesystem failures leave orphan chunks behind, which is safe
+ * for a content-addressed store.
+ */
+static void delete_orphan_chunks(nm_store_t *store,
+                                 const nm_manifest_t *deleted)
+{
+    char **keys = NULL;
+    size_t key_count = 0u;
+    bool *referenced = NULL;
+    bool deleted_any = false;
+    size_t unique;
+
+    if (deleted == NULL || deleted->chunk_count == 0u ||
+        deleted->chunk_hashes == NULL) {
+        return;
+    }
+    unique = sort_unique_hashes(deleted->chunk_hashes,
+                                (size_t)deleted->chunk_count);
+    referenced = calloc(unique, sizeof(*referenced));
+    if (referenced == NULL) {
+        return;
+    }
+    if (nm_store_list_live_keys(store, &keys, &key_count) == NM_OK) {
+        for (size_t i = 0u; i < key_count; ++i) {
+            nm_manifest_t other;
+            memset(&other, 0, sizeof(other));
+            if (nm_store_get_manifest(store, keys[i], &other) == NM_OK &&
+                !other.deleted && other.chunk_count > 0u &&
+                other.chunk_hashes != NULL) {
+                for (uint32_t j = 0u; j < other.chunk_count; ++j) {
+                    size_t index = 0u;
+                    const uint8_t *hash =
+                        other.chunk_hashes + ((size_t)j * NM_SHA256_LEN);
+                    if (find_hash_index(deleted->chunk_hashes, unique, hash,
+                                        &index)) {
+                        referenced[index] = true;
+                    }
+                }
+            }
+            nm_manifest_free(&other);
+        }
+    }
+    nm_store_free_keys(keys, key_count);
+    for (size_t i = 0u; i < unique; ++i) {
+        if (!referenced[i] &&
+            delete_chunk_file(store,
+                              deleted->chunk_hashes +
+                                  (i * NM_SHA256_LEN)) == NM_OK) {
+            deleted_any = true;
+        }
+    }
+    if (deleted_any) {
+        (void)fsync_directory(store->chunks_dir);
+    }
+    free(referenced);
+}
+
+static int store_write_tombstone(nm_store_t *store, const char *key,
+                                 uint64_t timestamp, uint64_t *out_ms)
+{
+    nm_manifest_t tombstone;
+    int result;
+
+    memset(&tombstone, 0, sizeof(tombstone));
+    result = nm_manifest_init_tombstone(&tombstone, key, timestamp);
+    if (result != NM_OK) {
+        return result;
+    }
+    result = nm_store_put_manifest(store, &tombstone);
+    if (result == NM_OK && out_ms != NULL) {
+        *out_ms = timestamp;
+    }
+    nm_manifest_free(&tombstone);
+    return result;
+}
+
+int nm_store_delete_manifest(nm_store_t *store, const char *key,
+                             uint64_t *deleted_ms)
+{
+    nm_manifest_t current;
+    uint64_t now = 0u;
+    uint64_t timestamp;
+    int result;
+
+    if (!store_is_initialized(store) || !nm_key_is_valid(key)) {
+        return NM_ERR_INVALID;
+    }
+    if (deleted_ms != NULL) {
+        *deleted_ms = 0u;
+    }
+    memset(&current, 0, sizeof(current));
+    result = nm_store_get_manifest(store, key, &current);
+    if (result != NM_OK) {
+        return result;
+    }
+    if (current.deleted) {
+        nm_manifest_free(&current);
+        return NM_ERR_NOT_FOUND;
+    }
+    result = current_time_ms(&now);
+    if (result != NM_OK) {
+        nm_manifest_free(&current);
+        return result;
+    }
+    if (current.updated_ms == UINT64_MAX) {
+        nm_manifest_free(&current);
+        return NM_ERR_INVALID;
+    }
+    timestamp = now > current.updated_ms ? now : current.updated_ms + 1u;
+    result = store_write_tombstone(store, key, timestamp, deleted_ms);
+    if (result == NM_OK) {
+        delete_orphan_chunks(store, &current);
+    }
+    nm_manifest_free(&current);
+    return result;
+}
+
+int nm_store_apply_tombstone(nm_store_t *store, const char *key,
+                             uint64_t deleted_ms)
+{
+    nm_manifest_t current;
+    uint64_t now = 0u;
+    uint64_t timestamp;
+    int result;
+
+    if (!store_is_initialized(store) || !nm_key_is_valid(key)) {
+        return NM_ERR_INVALID;
+    }
+    if (deleted_ms == 0u) {
+        result = current_time_ms(&now);
+        if (result != NM_OK) {
+            return result;
+        }
+        deleted_ms = now;
+    }
+    memset(&current, 0, sizeof(current));
+    result = nm_store_get_manifest(store, key, &current);
+    if (result == NM_ERR_NOT_FOUND) {
+        return store_write_tombstone(store, key, deleted_ms, NULL);
+    }
+    if (result != NM_OK) {
+        return result;
+    }
+    if (current.deleted) {
+        if (current.updated_ms >= deleted_ms) {
+            nm_manifest_free(&current);
+            return NM_OK;
+        }
+        result = store_write_tombstone(store, key, deleted_ms, NULL);
+        nm_manifest_free(&current);
+        return result;
+    }
+    if (current.updated_ms == UINT64_MAX) {
+        nm_manifest_free(&current);
+        return NM_ERR_INVALID;
+    }
+    timestamp = deleted_ms > current.updated_ms ? deleted_ms
+                                                : current.updated_ms + 1u;
+    result = store_write_tombstone(store, key, timestamp, NULL);
+    if (result == NM_OK) {
+        delete_orphan_chunks(store, &current);
+    }
+    nm_manifest_free(&current);
+    return result;
 }
 
 /* ------------------------------------------------------------------------- */

@@ -108,11 +108,11 @@ size_t nm_cluster_up_peer_count(const nm_cluster_t *cluster);
 uint32_t nm_cluster_quorum(const nm_cluster_t *cluster);
 
 /*
- * Forward a locally committed chunk/manifest to peers. The chunk hash/key must
- * already be present in the local store. Returns NM_OK if a transaction was
- * accepted and the callback will be called asynchronously. Returns an error if
- * no transaction could be started (invalid input/allocation failure); in that
- * case no callback occurs.
+ * Forward a locally committed chunk/manifest/deletion to peers. The chunk
+ * hash/key must already be present in the local store. Returns NM_OK if a
+ * transaction was accepted and the callback will be called asynchronously.
+ * Returns an error if no transaction could be started (invalid input/allocation
+ * failure); in that case no callback occurs.
  */
 int nm_cluster_replicate_chunk(nm_cluster_t *cluster,
                                const uint8_t hash[NM_SHA256_LEN],
@@ -123,6 +123,10 @@ int nm_cluster_replicate_manifest(nm_cluster_t *cluster,
                                   const nm_manifest_t *manifest,
                                   nm_cluster_write_done_fn callback,
                                   void *opaque);
+int nm_cluster_replicate_delete(nm_cluster_t *cluster, const char *key,
+                                uint64_t deleted_ms,
+                                nm_cluster_write_done_fn callback,
+                                void *opaque);
 
 #ifdef __cplusplus
 }

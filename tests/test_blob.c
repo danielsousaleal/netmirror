@@ -707,6 +707,186 @@ static void test_key_listing(nm_store_t *store)
     nm_store_free_keys(keys, count);
 }
 
+static bool key_list_contains(char **keys, size_t count, const char *key)
+{
+    for (size_t i = 0u; i < count; ++i) {
+        if (strcmp(keys[i], key) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void test_delete_and_tombstones(nm_store_t *store)
+{
+    static const char shared_text[] = "shared delete chunk";
+    static const char unique_text[] = "unique delete chunk";
+    const char *owner_key = "delete-owner";
+    const char *shared_key = "delete-shared";
+    const char *unique_key = "delete-unique";
+    nm_manifest_t owner;
+    nm_manifest_t shared;
+    nm_manifest_t unique;
+    nm_manifest_t loaded;
+    nm_manifest_t decoded;
+    uint8_t shared_hash[NM_SHA256_LEN];
+    uint8_t unique_hash[NM_SHA256_LEN];
+    uint8_t *serialized = NULL;
+    size_t serialized_length = 0u;
+    uint64_t deleted_ms = 0u;
+    uint64_t unique_deleted_ms = 0u;
+    char **keys = NULL;
+    size_t count = 0u;
+    bool exists = false;
+
+    memset(&owner, 0, sizeof(owner));
+    memset(&shared, 0, sizeof(shared));
+    memset(&unique, 0, sizeof(unique));
+    memset(&loaded, 0, sizeof(loaded));
+    memset(&decoded, 0, sizeof(decoded));
+
+    CHECK_STATUS(nm_sha256_buf(shared_text, sizeof(shared_text) - 1u,
+                               shared_hash),
+                 NM_OK);
+    CHECK_STATUS(nm_sha256_buf(unique_text, sizeof(unique_text) - 1u,
+                               unique_hash),
+                 NM_OK);
+    CHECK_STATUS(nm_store_put_chunk(store, shared_hash, shared_text,
+                                    sizeof(shared_text) - 1u),
+                 NM_OK);
+    CHECK_STATUS(nm_store_put_chunk(store, unique_hash, unique_text,
+                                    sizeof(unique_text) - 1u),
+                 NM_OK);
+
+    CHECK_STATUS(nm_manifest_init(&owner, owner_key,
+                                  sizeof(shared_text) - 1u),
+                 NM_OK);
+    CHECK_STATUS(nm_manifest_init(&shared, shared_key,
+                                  sizeof(shared_text) - 1u),
+                 NM_OK);
+    CHECK_STATUS(nm_manifest_init(&unique, unique_key,
+                                  sizeof(unique_text) - 1u),
+                 NM_OK);
+    if (owner.chunk_hashes != NULL) {
+        memcpy(owner.chunk_hashes, shared_hash, NM_SHA256_LEN);
+    }
+    if (shared.chunk_hashes != NULL) {
+        memcpy(shared.chunk_hashes, shared_hash, NM_SHA256_LEN);
+    }
+    if (unique.chunk_hashes != NULL) {
+        memcpy(unique.chunk_hashes, unique_hash, NM_SHA256_LEN);
+    }
+    memset(owner.object_hash, 0x11, NM_SHA256_LEN);
+    memset(shared.object_hash, 0x22, NM_SHA256_LEN);
+    memset(unique.object_hash, 0x33, NM_SHA256_LEN);
+    CHECK_STATUS(nm_manifest_validate(&owner), NM_OK);
+    CHECK_STATUS(nm_manifest_validate(&shared), NM_OK);
+    CHECK_STATUS(nm_manifest_validate(&unique), NM_OK);
+    CHECK_STATUS(nm_store_put_manifest(store, &owner), NM_OK);
+    CHECK_STATUS(nm_store_put_manifest(store, &shared), NM_OK);
+    CHECK_STATUS(nm_store_put_manifest(store, &unique), NM_OK);
+    CHECK_STATUS(nm_store_has_chunk(store, shared_hash, &exists), NM_OK);
+    CHECK(exists);
+    CHECK_STATUS(nm_store_has_chunk(store, unique_hash, &exists), NM_OK);
+    CHECK(exists);
+
+    CHECK_STATUS(nm_store_delete_manifest(store, owner_key, &deleted_ms),
+                 NM_OK);
+    CHECK(deleted_ms > 0u);
+    CHECK_STATUS(nm_store_has_chunk(store, shared_hash, &exists), NM_OK);
+    CHECK(exists);
+    CHECK_STATUS(nm_store_has_chunk(store, unique_hash, &exists), NM_OK);
+    CHECK(exists);
+
+    CHECK_STATUS(nm_store_get_manifest(store, owner_key, &loaded), NM_OK);
+    CHECK(loaded.deleted);
+    CHECK(loaded.updated_ms == deleted_ms);
+    CHECK(loaded.chunk_count == 0u);
+    CHECK(loaded.chunk_hashes == NULL);
+    CHECK_STATUS(nm_manifest_validate(&loaded), NM_OK);
+    CHECK(nm_manifest_chunk_length(&loaded, 0u) == 0u);
+
+    CHECK_STATUS(nm_manifest_serialize(&loaded, &serialized,
+                                       &serialized_length),
+                 NM_OK);
+    CHECK(serialized != NULL);
+    if (serialized != NULL) {
+        CHECK(serialized[5] == (uint8_t)NM_MANIFEST_FLAG_DELETED);
+        CHECK(serialized_length ==
+              (size_t)NM_MANIFEST_FIXED_HEADER_SIZE + strlen(owner_key) +
+                  (size_t)NM_MANIFEST_FIXED_TRAILER_SIZE);
+        CHECK_STATUS(nm_manifest_deserialize(serialized, serialized_length,
+                                             &decoded),
+                     NM_OK);
+        CHECK(decoded.deleted);
+        CHECK(decoded.updated_ms == deleted_ms);
+        CHECK(decoded.chunk_count == 0u);
+        CHECK(decoded.chunk_hashes == NULL);
+    }
+    nm_manifest_free(&loaded);
+    nm_manifest_free(&decoded);
+    free(serialized);
+    serialized = NULL;
+
+    CHECK_STATUS(nm_store_list_live_keys(store, &keys, &count), NM_OK);
+    CHECK(!key_list_contains(keys, count, owner_key));
+    CHECK(key_list_contains(keys, count, shared_key));
+    CHECK(key_list_contains(keys, count, unique_key));
+    nm_store_free_keys(keys, count);
+    keys = NULL;
+    count = 0u;
+
+    CHECK_STATUS(nm_store_list_keys(store, &keys, &count), NM_OK);
+    CHECK(key_list_contains(keys, count, owner_key));
+    nm_store_free_keys(keys, count);
+    keys = NULL;
+    count = 0u;
+
+    CHECK_STATUS(nm_store_delete_manifest(store, owner_key, &deleted_ms),
+                 NM_ERR_NOT_FOUND);
+
+    CHECK_STATUS(nm_store_delete_manifest(store, unique_key,
+                                          &unique_deleted_ms),
+                 NM_OK);
+    CHECK(unique_deleted_ms > 0u);
+    CHECK_STATUS(nm_store_has_chunk(store, unique_hash, &exists), NM_OK);
+    CHECK(!exists);
+    CHECK_STATUS(nm_store_has_chunk(store, shared_hash, &exists), NM_OK);
+    CHECK(exists);
+
+    CHECK_STATUS(nm_store_apply_tombstone(store, shared_key, deleted_ms),
+                 NM_OK);
+    CHECK_STATUS(nm_store_has_chunk(store, shared_hash, &exists), NM_OK);
+    CHECK(!exists);
+
+    CHECK_STATUS(nm_store_apply_tombstone(store, "delete-missing", 12345u),
+                 NM_OK);
+    CHECK_STATUS(nm_store_get_manifest(store, "delete-missing", &loaded),
+                 NM_OK);
+    CHECK(loaded.deleted);
+    nm_manifest_free(&loaded);
+
+    CHECK_STATUS(nm_store_list_live_keys(store, &keys, &count), NM_OK);
+    CHECK(!key_list_contains(keys, count, owner_key));
+    CHECK(!key_list_contains(keys, count, shared_key));
+    CHECK(!key_list_contains(keys, count, unique_key));
+    CHECK(!key_list_contains(keys, count, "delete-missing"));
+    nm_store_free_keys(keys, count);
+    keys = NULL;
+    count = 0u;
+
+    CHECK_STATUS(nm_store_list_keys(store, &keys, &count), NM_OK);
+    CHECK(key_list_contains(keys, count, owner_key));
+    CHECK(key_list_contains(keys, count, shared_key));
+    CHECK(key_list_contains(keys, count, unique_key));
+    CHECK(key_list_contains(keys, count, "delete-missing"));
+    nm_store_free_keys(keys, count);
+
+    nm_manifest_free(&owner);
+    nm_manifest_free(&shared);
+    nm_manifest_free(&unique);
+}
+
 int main(void)
 {
     char temporary[NM_PATH_MAX];
@@ -749,6 +929,7 @@ int main(void)
     test_manifest_roundtrip(&store_one);
     test_large_manifest_roundtrip();
     test_empty_and_invalid_manifests(&store_one);
+    test_delete_and_tombstones(&store_one);
     test_file_ingest(&store_two, temporary);
     test_key_listing(&store_two);
 

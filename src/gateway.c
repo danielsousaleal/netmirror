@@ -38,13 +38,16 @@
 #define GW_MAX_TARGET (NM_GATEWAY_MAX_TARGET_BYTES + 1u)
 #define GW_HTTP_INPUT_SIZE NM_GATEWAY_INPUT_BUFFER_BYTES
 #define GW_HEADER_SCRATCH (NM_GATEWAY_MAX_HEADER_BYTES + 1u)
+#define GW_MAX_LIST_KEYS 65536u
 
 typedef struct gw_shared gw_shared_t;
 typedef struct gw_client gw_client_t;
 
 typedef enum gw_method {
     GW_METHOD_GET = 0,
-    GW_METHOD_PUT
+    GW_METHOD_PUT,
+    GW_METHOD_DELETE,
+    GW_METHOD_OPTIONS
 } gw_method_t;
 
 typedef struct gw_request {
@@ -53,9 +56,16 @@ typedef struct gw_request {
     bool expect_continue;
     bool has_content_length;
     bool is_health;
+    bool is_list;
     uint64_t content_length;
     char key[NM_MAX_KEY];
 } gw_request_t;
+
+typedef struct gw_key_list {
+    char **keys;
+    size_t count;
+    size_t capacity;
+} gw_key_list_t;
 
 struct gw_client {
     int fd;
@@ -394,6 +404,9 @@ static bool send_response_head(gw_client_t *client, int status,
         header, sizeof(header),
         "HTTP/1.1 %d %s\r\n"
         "Server: netmirror-gateway\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %llu\r\n"
         "Connection: %s\r\n"
@@ -413,7 +426,8 @@ static bool send_response_head(gw_client_t *client, int status,
 static bool send_error(gw_client_t *client, int status)
 {
     char body[192];
-    const char *extra = status == 405 ? "Allow: GET, PUT\r\n" : "";
+    const char *extra =
+        status == 405 ? "Allow: GET, PUT, DELETE, OPTIONS\r\n" : "";
     int body_length;
 
     body_length = snprintf(body, sizeof(body),
@@ -527,6 +541,10 @@ static int resolve_target(const char *target, gw_request_t *request)
     }
     if (strcmp(target, "/health") == 0) {
         request->is_health = true;
+        return 0;
+    }
+    if (strcmp(target, "/objects") == 0) {
+        request->is_list = true;
         return 0;
     }
     if (strcmp(target, "/obj") == 0) {
@@ -651,17 +669,35 @@ static int parse_http_request(char *header, gw_request_t *request)
         request->method = GW_METHOD_GET;
     } else if (strcmp(method_text, "PUT") == 0) {
         request->method = GW_METHOD_PUT;
+    } else if (strcmp(method_text, "DELETE") == 0) {
+        request->method = GW_METHOD_DELETE;
+    } else if (strcmp(method_text, "OPTIONS") == 0) {
+        request->method = GW_METHOD_OPTIONS;
     } else {
         return 405;
-    }
-    int status = resolve_target(target, request);
-    if (status != 0) {
-        return status;
     }
     request->keep_alive =
         version_http11 ? !close_seen : keep_alive_seen;
     if (close_seen) {
         request->keep_alive = false;
+    }
+    if (request->method == GW_METHOD_OPTIONS) {
+        if (target[0] != '/' ||
+            strlen(target) >= NM_GATEWAY_MAX_TARGET_BYTES) {
+            return 400;
+        }
+        if (expect_seen) {
+            return 417;
+        }
+        if (request->has_content_length && request->content_length != 0u) {
+            return 400;
+        }
+        request->expect_continue = false;
+        return 0;
+    }
+    int status = resolve_target(target, request);
+    if (status != 0) {
+        return status;
     }
     request->expect_continue =
         expect_seen && request->method == GW_METHOD_PUT;
@@ -676,10 +712,33 @@ static int parse_http_request(char *header, gw_request_t *request)
         request->expect_continue = false;
         return 0;
     }
+    if (request->is_list) {
+        if (request->method != GW_METHOD_GET) {
+            return 405;
+        }
+        if (request->has_content_length && request->content_length != 0u) {
+            return 400;
+        }
+        if (expect_seen) {
+            return 417;
+        }
+        request->expect_continue = false;
+        return 0;
+    }
     if (request->method == GW_METHOD_PUT) {
         if (!request->has_content_length) {
             return 411;
         }
+        return 0;
+    }
+    if (request->method == GW_METHOD_DELETE) {
+        if (request->has_content_length && request->content_length != 0u) {
+            return 400;
+        }
+        if (expect_seen) {
+            return 417;
+        }
+        request->expect_continue = false;
         return 0;
     }
     if (expect_seen) {
@@ -934,8 +993,11 @@ static nm_status_t fetch_manifest_from_nodes(gw_shared_t *shared,
                                              nm_manifest_t *manifest)
 {
     size_t start = node_start(shared);
+    nm_manifest_t best;
+    bool saw_manifest = false;
     bool saw_not_found = false;
 
+    memset(&best, 0, sizeof(best));
     for (size_t attempt = 0u; attempt < shared->options.node_count; ++attempt) {
         size_t index = (start + attempt) % shared->options.node_count;
         int fd = connect_node(shared, index);
@@ -967,20 +1029,36 @@ static nm_status_t fetch_manifest_from_nodes(gw_shared_t *shared,
             continue;
         }
         if (frame.type == NM_MSG_OBJECT) {
+            nm_manifest_t candidate;
+            memset(&candidate, 0, sizeof(candidate));
             result = nm_manifest_deserialize(frame.payload, frame.length,
-                                             manifest);
+                                             &candidate);
             nm_frame_free(&frame);
             nm_close_fd(&fd);
-            if (result == NM_OK && strcmp(manifest->key, key) == 0) {
-                return NM_OK;
+            if (result != NM_OK || strcmp(candidate.key, key) != 0) {
+                nm_manifest_free(&candidate);
+                continue;
             }
-            nm_manifest_free(manifest);
-            memset(manifest, 0, sizeof(*manifest));
+            if (!saw_manifest ||
+                candidate.updated_ms > best.updated_ms ||
+                (candidate.updated_ms == best.updated_ms &&
+                 candidate.deleted && !best.deleted)) {
+                nm_manifest_free(&best);
+                best = candidate;
+                saw_manifest = true;
+            } else {
+                nm_manifest_free(&candidate);
+            }
             continue;
         }
         nm_frame_free(&frame);
         nm_close_fd(&fd);
     }
+    if (saw_manifest) {
+        *manifest = best;
+        return NM_OK;
+    }
+    nm_manifest_free(&best);
     return saw_not_found ? NM_ERR_NOT_FOUND : NM_ERR_UNAVAILABLE;
 }
 
@@ -1075,6 +1153,291 @@ static int http_status_for(nm_status_t status)
     }
 }
 
+static void gw_key_list_free(gw_key_list_t *list)
+{
+    if (list == NULL) {
+        return;
+    }
+    for (size_t i = 0u; i < list->count; ++i) {
+        free(list->keys[i]);
+    }
+    free(list->keys);
+    memset(list, 0, sizeof(*list));
+}
+
+static int gw_key_list_append(gw_key_list_t *list, const char *key)
+{
+    char *copy;
+    char **new_keys;
+    size_t new_capacity;
+    size_t key_length;
+
+    if (list == NULL || key == NULL) {
+        return NM_ERR_INVALID;
+    }
+    if (list->count >= GW_MAX_LIST_KEYS) {
+        return NM_ERR_TOO_LARGE;
+    }
+    if (list->count == list->capacity) {
+        new_capacity = list->capacity == 0u ? 32u : list->capacity * 2u;
+        if (new_capacity > GW_MAX_LIST_KEYS) {
+            new_capacity = GW_MAX_LIST_KEYS;
+        }
+        new_keys = realloc(list->keys, new_capacity * sizeof(*new_keys));
+        if (new_keys == NULL) {
+            return NM_ERR_NOMEM;
+        }
+        list->keys = new_keys;
+        list->capacity = new_capacity;
+    }
+    key_length = strlen(key);
+    copy = malloc(key_length + 1u);
+    if (copy == NULL) {
+        return NM_ERR_NOMEM;
+    }
+    memcpy(copy, key, key_length + 1u);
+    list->keys[list->count] = copy;
+    list->count += 1u;
+    return NM_OK;
+}
+
+static int build_object_list_json(const gw_key_list_t *list, char **out,
+                                  size_t *out_length)
+{
+    static const char prefix[] = "{\"objects\":[";
+    size_t length = (sizeof(prefix) - 1u) + 2u + 1u;
+    size_t cursor;
+    char *json;
+
+    if (list == NULL || out == NULL || out_length == NULL) {
+        return NM_ERR_INVALID;
+    }
+    *out = NULL;
+    *out_length = 0u;
+    for (size_t i = 0u; i < list->count; ++i) {
+        size_t key_length = strlen(list->keys[i]);
+        size_t extra = key_length + 2u + (i == 0u ? 0u : 1u);
+        if (length > SIZE_MAX - extra) {
+            return NM_ERR_TOO_LARGE;
+        }
+        length += extra;
+    }
+    json = malloc(length);
+    if (json == NULL) {
+        return NM_ERR_NOMEM;
+    }
+    memcpy(json, prefix, sizeof(prefix) - 1u);
+    cursor = sizeof(prefix) - 1u;
+    for (size_t i = 0u; i < list->count; ++i) {
+        size_t key_length = strlen(list->keys[i]);
+        if (i > 0u) {
+            json[cursor++] = ',';
+        }
+        json[cursor++] = '"';
+        memcpy(json + cursor, list->keys[i], key_length);
+        cursor += key_length;
+        json[cursor++] = '"';
+    }
+    json[cursor++] = ']';
+    json[cursor++] = '}';
+    json[cursor] = '\0';
+    if (cursor + 1u != length) {
+        free(json);
+        return NM_ERR_SYSTEM;
+    }
+    *out = json;
+    *out_length = cursor;
+    return NM_OK;
+}
+
+static nm_status_t fetch_object_list_from_node(gw_shared_t *shared,
+                                               size_t index,
+                                               gw_key_list_t *list)
+{
+    int fd;
+    uint32_t offset = 0u;
+    nm_status_t result = NM_ERR_UNAVAILABLE;
+
+    if (shared == NULL || list == NULL) {
+        return NM_ERR_INVALID;
+    }
+    fd = connect_node(shared, index);
+    if (fd < 0) {
+        return NM_ERR_UNAVAILABLE;
+    }
+    for (;;) {
+        uint8_t request[NM_LIST_KEYS_REQ_WIRE_SIZE];
+        nm_frame_t frame;
+        uint32_t total;
+        uint32_t returned;
+        size_t cursor;
+        int status;
+
+        memset(&frame, 0, sizeof(frame));
+        nm_put_u32_be(request, offset);
+        nm_put_u32_be(request + 4u, NM_LIST_KEYS_DEFAULT_BATCH);
+        status = nm_frame_send(fd, NM_MSG_LIST_OBJECTS_REQ, request,
+                               sizeof(request));
+        if (status != NM_OK) {
+            result = NM_ERR_UNAVAILABLE;
+            break;
+        }
+        status = nm_frame_recv(fd, &frame);
+        if (status != NM_OK) {
+            result = NM_ERR_UNAVAILABLE;
+            break;
+        }
+        if (frame.type == NM_MSG_ERROR) {
+            if (!decode_error(&frame, &result)) {
+                result = NM_ERR_PROTOCOL;
+            }
+            nm_frame_free(&frame);
+            break;
+        }
+        if (frame.type != NM_MSG_LIST_OBJECTS_RESP || frame.payload == NULL ||
+            frame.length < NM_LIST_KEYS_RESP_HEADER_SIZE) {
+            nm_frame_free(&frame);
+            result = NM_ERR_PROTOCOL;
+            break;
+        }
+        total = nm_get_u32_be(frame.payload);
+        returned = nm_get_u32_be(frame.payload + 4u);
+        if (returned > NM_LIST_KEYS_DEFAULT_BATCH) {
+            nm_frame_free(&frame);
+            result = NM_ERR_PROTOCOL;
+            break;
+        }
+        result = NM_OK;
+        cursor = NM_LIST_KEYS_RESP_HEADER_SIZE;
+        for (uint32_t i = 0u; i < returned; ++i) {
+            char key[NM_MAX_KEY];
+            uint16_t key_length;
+
+            if (cursor > frame.length || frame.length - cursor < 2u) {
+                result = NM_ERR_PROTOCOL;
+                break;
+            }
+            key_length = nm_get_u16_be(frame.payload + cursor);
+            cursor += 2u;
+            if (key_length == 0u || key_length >= NM_MAX_KEY ||
+                cursor > frame.length ||
+                frame.length - cursor < (uint64_t)key_length) {
+                result = NM_ERR_PROTOCOL;
+                break;
+            }
+            if (memchr(frame.payload + cursor, '\0', key_length) != NULL) {
+                result = NM_ERR_PROTOCOL;
+                break;
+            }
+            memcpy(key, frame.payload + cursor, key_length);
+            key[key_length] = '\0';
+            cursor += key_length;
+            if (!nm_key_is_valid(key)) {
+                result = NM_ERR_PROTOCOL;
+                break;
+            }
+            status = gw_key_list_append(list, key);
+            if (status != NM_OK) {
+                result = (nm_status_t)status;
+                break;
+            }
+        }
+        if (result == NM_OK && cursor != frame.length) {
+            result = NM_ERR_PROTOCOL;
+        }
+        nm_frame_free(&frame);
+        if (result != NM_OK) {
+            break;
+        }
+        if (returned == 0u) {
+            result = offset >= total ? NM_OK : NM_ERR_PROTOCOL;
+            break;
+        }
+        if (offset > UINT32_MAX - returned) {
+            result = NM_ERR_PROTOCOL;
+            break;
+        }
+        offset += returned;
+        if (offset >= total) {
+            result = NM_OK;
+            break;
+        }
+        if (list->count >= GW_MAX_LIST_KEYS) {
+            result = NM_ERR_TOO_LARGE;
+            break;
+        }
+    }
+    nm_close_fd(&fd);
+    return result;
+}
+
+static nm_status_t fetch_object_list(gw_shared_t *shared, gw_key_list_t *list)
+{
+    size_t start;
+    nm_status_t result = NM_ERR_UNAVAILABLE;
+
+    if (shared == NULL || list == NULL) {
+        return NM_ERR_INVALID;
+    }
+    start = node_start(shared);
+    for (size_t attempt = 0u; attempt < shared->options.node_count; ++attempt) {
+        size_t index = (start + attempt) % shared->options.node_count;
+        gw_key_list_free(list);
+        result = fetch_object_list_from_node(shared, index, list);
+        if (result == NM_OK || result == NM_ERR_TOO_LARGE) {
+            return result;
+        }
+    }
+    gw_key_list_free(list);
+    return result;
+}
+
+static nm_status_t delete_object_on_nodes(gw_shared_t *shared,
+                                          const char *key)
+{
+    uint8_t digest[NM_SHA256_LEN];
+    size_t start;
+    nm_status_t result = NM_ERR_UNAVAILABLE;
+
+    if (shared == NULL || key == NULL ||
+        nm_manifest_key_hash(key, digest) != NM_OK) {
+        return NM_ERR_INVALID;
+    }
+    start = node_start(shared);
+    for (size_t attempt = 0u; attempt < shared->options.node_count; ++attempt) {
+        size_t index = (start + attempt) % shared->options.node_count;
+        int fd = connect_node(shared, index);
+        nm_status_t status = NM_ERR_UNAVAILABLE;
+        bool acknowledged;
+
+        if (fd < 0) {
+            result = NM_ERR_UNAVAILABLE;
+            continue;
+        }
+        if (nm_frame_send(fd, NM_MSG_DELETE_OBJECT, key, strlen(key)) !=
+            NM_OK) {
+            nm_close_fd(&fd);
+            result = NM_ERR_UNAVAILABLE;
+            continue;
+        }
+        acknowledged = receive_ack(fd, NM_MSG_DELETE_OBJECT, digest, &status);
+        nm_close_fd(&fd);
+        if (!acknowledged) {
+            result = NM_ERR_UNAVAILABLE;
+            continue;
+        }
+        if (status == NM_OK) {
+            return NM_OK;
+        }
+        if (status == NM_ERR_NOT_FOUND) {
+            result = NM_ERR_NOT_FOUND;
+            continue;
+        }
+        return status;
+    }
+    return result;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Request handlers                                                          */
 /* ------------------------------------------------------------------------- */
@@ -1115,6 +1478,11 @@ static bool handle_get(gw_shared_t *shared, gw_client_t *client,
     if (status != NM_OK) {
         int http_status = http_status_for(status);
         (void)send_error(client, http_status);
+        return false;
+    }
+    if (manifest.deleted) {
+        nm_manifest_free(&manifest);
+        (void)send_error(client, 404);
         return false;
     }
     if (nm_manifest_validate(&manifest) != NM_OK) {
@@ -1293,6 +1661,66 @@ cleanup:
     return success && keep_alive;
 }
 
+static bool handle_options(gw_shared_t *shared, gw_client_t *client,
+                           const gw_request_t *request)
+{
+    bool keep_alive = request->keep_alive && !atomic_load(&shared->stopping);
+
+    if (!send_response_head(client, 204, "text/plain", 0u, keep_alive,
+                            "Allow: GET, PUT, DELETE, OPTIONS\r\n")) {
+        return false;
+    }
+    return keep_alive;
+}
+
+static bool handle_list_objects(gw_shared_t *shared, gw_client_t *client,
+                                const gw_request_t *request)
+{
+    gw_key_list_t list;
+    char *json = NULL;
+    size_t json_length = 0u;
+    nm_status_t status;
+    bool keep_alive = request->keep_alive && !atomic_load(&shared->stopping);
+    bool sent;
+
+    memset(&list, 0, sizeof(list));
+    status = fetch_object_list(shared, &list);
+    if (status != NM_OK) {
+        gw_key_list_free(&list);
+        (void)send_error(client, http_status_for(status));
+        return false;
+    }
+    status = (nm_status_t)build_object_list_json(&list, &json, &json_length);
+    gw_key_list_free(&list);
+    if (status != NM_OK) {
+        (void)send_error(client, http_status_for(status));
+        return false;
+    }
+    sent = send_response_head(client, 200, "application/json", json_length,
+                              keep_alive, "");
+    if (sent) {
+        sent = send_all(client->fd, json, json_length);
+    }
+    free(json);
+    return sent && keep_alive;
+}
+
+static bool handle_delete(gw_shared_t *shared, gw_client_t *client,
+                          const gw_request_t *request)
+{
+    bool keep_alive = request->keep_alive && !atomic_load(&shared->stopping);
+    nm_status_t status = delete_object_on_nodes(shared, request->key);
+
+    if (status != NM_OK) {
+        (void)send_error(client, http_status_for(status));
+        return false;
+    }
+    if (!send_response_head(client, 204, "text/plain", 0u, keep_alive, "")) {
+        return false;
+    }
+    return keep_alive;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Client worker                                                             */
 /* ------------------------------------------------------------------------- */
@@ -1352,10 +1780,16 @@ static void *client_worker(void *argument)
             break;
         }
         bool keep_alive;
-        if (request.is_health) {
+        if (request.method == GW_METHOD_OPTIONS) {
+            keep_alive = handle_options(shared, client, &request);
+        } else if (request.is_health) {
             keep_alive = handle_health(shared, client, &request);
+        } else if (request.is_list) {
+            keep_alive = handle_list_objects(shared, client, &request);
         } else if (request.method == GW_METHOD_GET) {
             keep_alive = handle_get(shared, client, &request);
+        } else if (request.method == GW_METHOD_DELETE) {
+            keep_alive = handle_delete(shared, client, &request);
         } else {
             keep_alive = handle_put(shared, client, &request);
         }
@@ -1407,6 +1841,9 @@ static void reject_connection(int fd)
 {
     static const char response[] =
         "HTTP/1.1 503 Service Unavailable\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
         "Content-Length: 0\r\n"
         "Connection: close\r\n"
         "\r\n";

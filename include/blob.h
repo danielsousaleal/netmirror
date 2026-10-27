@@ -140,10 +140,18 @@ int nm_store_list_chunks(const nm_store_t *store,
  * object_hash starts as zero bytes and updated_ms is set to now. The caller
  * fills object_hash and each chunk hash, then validates/persists the manifest.
  * Validation rejects the all-zero object_hash placeholder, so an incomplete
- * manifest cannot be committed.
+ * live manifest cannot be committed.
  */
 int nm_manifest_init(nm_manifest_t *manifest, const char *key,
                      uint64_t total_size);
+
+/*
+ * Initialize a tombstone manifest for `key` with the given deletion timestamp.
+ * The tombstone has total_size 0 and no chunk hashes; it is valid for
+ * persistence and anti-entropy propagation.
+ */
+int nm_manifest_init_tombstone(nm_manifest_t *manifest, const char *key,
+                               uint64_t deleted_ms);
 
 /*
  * Release dynamic members and clear the struct. Safe on a zeroed or already
@@ -153,6 +161,7 @@ void nm_manifest_free(nm_manifest_t *manifest);
 
 /*
  * Check key, bounds, total_size/chunk_count consistency and dynamic storage.
+ * Tombstones are valid with total_size 0, chunk_count 0 and no chunk hashes.
  * Returns NM_OK or NM_ERR_INVALID.
  */
 int nm_manifest_validate(const nm_manifest_t *manifest);
@@ -188,13 +197,41 @@ int nm_store_get_manifest(nm_store_t *store, const char *key,
                           nm_manifest_t *out);
 
 /*
- * List all valid object keys, sorted lexicographically for deterministic
- * anti-entropy pagination. On success returns NM_OK and a malloc'ed array of
- * malloc'ed NUL-terminated strings. The caller releases the whole result with
- * nm_store_free_keys(). For an empty store *keys is NULL and *count is zero.
- * Structurally invalid manifest files are skipped.
+ * Delete a live object by atomically replacing its manifest with a tombstone
+ * whose timestamp is newer than the current manifest. Chunks referenced only
+ * by that object are unlinked; shared chunks are kept. On success
+ * *deleted_ms receives the tombstone timestamp. Returns NM_ERR_NOT_FOUND if
+ * the key has no live manifest. Chunk cleanup is best effort after the
+ * tombstone is committed.
+ */
+int nm_store_delete_manifest(nm_store_t *store, const char *key,
+                             uint64_t *deleted_ms);
+
+/*
+ * Apply a tombstone received from a peer. If a live manifest exists with a
+ * timestamp >= deleted_ms, the local tombstone timestamp is advanced to
+ * local+1 so an explicit deletion wins locally. This function is idempotent,
+ * creates a tombstone if the key is absent, and performs the same best-effort
+ * orphan-chunk cleanup.
+ */
+int nm_store_apply_tombstone(nm_store_t *store, const char *key,
+                             uint64_t deleted_ms);
+
+/*
+ * List all manifest keys, including tombstones, sorted lexicographically for
+ * deterministic anti-entropy pagination. On success returns NM_OK and a
+ * malloc'ed array of malloc'ed NUL-terminated strings. The caller releases the
+ * whole result with nm_store_free_keys(). For an empty store *keys is NULL and
+ * *count is zero. Structurally invalid manifest files are skipped.
  */
 int nm_store_list_keys(const nm_store_t *store, char ***keys, size_t *count);
+
+/*
+ * List only live object keys (tombstones excluded), sorted lexicographically.
+ * This is the external listing view used by GET /objects.
+ */
+int nm_store_list_live_keys(const nm_store_t *store, char ***keys,
+                            size_t *count);
 void nm_store_free_keys(char **keys, size_t count);
 
 /* ------------------------------------------------------------------------- */

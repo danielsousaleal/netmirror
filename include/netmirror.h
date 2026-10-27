@@ -38,10 +38,22 @@
  *                   || returned * (u16 key_length || key bytes)
  *   REPLICA_STORE         same payload as STORE, never re-fanned-out
  *   REPLICA_STORE_OBJECT  same payload as STORE_OBJECT, never re-fanned-out
+ *   DELETE_OBJECT         key bytes (no NUL)
+ *   REPLICA_DELETE_OBJECT u64 deleted_ms || key bytes
+ *   LIST_OBJECTS_REQ      u32 offset || u32 limit
+ *   LIST_OBJECTS_RESP     u32 total || u32 returned
+ *                         || returned * (u16 key_length || key bytes)
  *
  * LIST_KEYS_* lets anti-entropy discover manifests created while a node was
  * offline. Keys are sorted lexicographically so pagination is deterministic.
- * Limits are clamped by the receiving node.
+ * Limits are clamped by the receiving node. LIST_KEYS_* includes tombstones
+ * so deletions survive a node that was offline; LIST_OBJECTS_* exposes only
+ * live keys to the gateway.
+ *
+ * A deletion is committed as a tombstone manifest (flags bit 0) with the
+ * deletion timestamp in updated_ms. A live manifest with a newer timestamp
+ * (a later upload of the same key) wins over an older tombstone. DELETE_OBJECT
+ * and REPLICA_DELETE_OBJECT ACKs use SHA-256(key) as their digest.
  *
  * REPLICA_* is the node-to-node write path. A node receiving a client STORE
  * coordinates quorum fan-out; receiving a REPLICA_STORE only applies the
@@ -57,7 +69,7 @@
  *   offset  size  field
  *   0       4     magic, ASCII "NMOB" (0x4e4d4f42)
  *   4       1     version (1)
- *   5       1     reserved (0)
+ *   5       1     flags (bit 0 = deleted; other bits must be 0)
  *   6       2     key_length (BE, 1..NM_MAX_KEY_LEN)
  *   8       n     key bytes (UTF-8, no NUL)
  *   8+n     8     total_size (BE)
@@ -67,7 +79,9 @@
  *   60+n    32*c  chunk digests, in object order
  *
  * Chunk i has length min(NM_CHUNK_SIZE, total_size - i*NM_CHUNK_SIZE).
- * A zero-byte object has zero chunks and is still a valid manifest.
+ * A zero-byte object has zero chunks and is still a valid live manifest.
+ * A tombstone has flags bit 0 set, total_size 0 and chunk_count 0; its
+ * object_hash is zero-filled and updated_ms is the deletion timestamp.
  *
  * PERSISTENT LAYOUT
  * -----------------
@@ -132,6 +146,7 @@ extern "C" {
 /* Manifest constants. Keep these in sync with the format documented above. */
 #define NM_MANIFEST_MAGIC 0x4E4D4F42u
 #define NM_MANIFEST_VERSION 1u
+#define NM_MANIFEST_FLAG_DELETED 0x01u
 #define NM_MANIFEST_FIXED_HEADER_SIZE 8u
 #define NM_MANIFEST_FIXED_TRAILER_SIZE 52u
 #define NM_MAX_MANIFEST_SIZE                                                   \
@@ -208,11 +223,15 @@ typedef enum nm_msg_type {
     NM_MSG_LIST_KEYS_REQ = 0x0D,
     NM_MSG_LIST_KEYS_RESP = 0x0E,
     NM_MSG_REPLICA_STORE = 0x0F,
-    NM_MSG_REPLICA_STORE_OBJECT = 0x10
+    NM_MSG_REPLICA_STORE_OBJECT = 0x10,
+    NM_MSG_DELETE_OBJECT = 0x11,
+    NM_MSG_REPLICA_DELETE_OBJECT = 0x12,
+    NM_MSG_LIST_OBJECTS_REQ = 0x13,
+    NM_MSG_LIST_OBJECTS_RESP = 0x14
 } nm_msg_type_t;
 
 #define NM_MSG_MIN NM_MSG_PING
-#define NM_MSG_MAX NM_MSG_REPLICA_STORE_OBJECT
+#define NM_MSG_MAX NM_MSG_LIST_OBJECTS_RESP
 
 /*
  * Status values. NM_OK is the only success value. Values travel on the wire
@@ -264,6 +283,7 @@ typedef struct nm_manifest {
     uint64_t total_size;
     uint64_t updated_ms;
     uint32_t chunk_count;
+    bool deleted;
     uint8_t object_hash[NM_SHA256_LEN];
     uint8_t *chunk_hashes;
 } nm_manifest_t;

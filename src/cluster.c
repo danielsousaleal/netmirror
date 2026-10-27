@@ -39,6 +39,7 @@ typedef struct nm_cluster_txn nm_cluster_txn_t;
 typedef enum nm_rpc_kind {
     NM_RPC_STORE = 0,
     NM_RPC_STORE_OBJECT,
+    NM_RPC_DELETE_OBJECT,
     NM_RPC_SYNC_INDEX,
     NM_RPC_SYNC_FETCH,
     NM_RPC_SYNC_LIST_KEYS,
@@ -936,7 +937,12 @@ static bool peer_sync_handle_manifest(nm_peer_t *peer,
         should_store = true;
     }
     if (should_store) {
-        result = nm_store_put_manifest(peer->cluster->store, &remote);
+        if (remote.deleted) {
+            result = nm_store_apply_tombstone(peer->cluster->store, remote.key,
+                                              remote.updated_ms);
+        } else {
+            result = nm_store_put_manifest(peer->cluster->store, &remote);
+        }
         if (result != NM_OK) {
             nm_manifest_free(&local);
             nm_manifest_free(&remote);
@@ -1003,7 +1009,8 @@ static bool peer_handle_response(nm_peer_t *peer, const nm_frame_t *frame)
                  (unsigned int)rpc->expected_type, (unsigned int)frame->type);
         return false;
     }
-    if (rpc->kind == NM_RPC_STORE || rpc->kind == NM_RPC_STORE_OBJECT) {
+    if (rpc->kind == NM_RPC_STORE || rpc->kind == NM_RPC_STORE_OBJECT ||
+        rpc->kind == NM_RPC_DELETE_OBJECT) {
         if (nm_wire_ack_decode(frame->payload, frame->length, &status,
                                &ack_type, digest) != NM_OK ||
             ack_type != rpc->ack_type ||
@@ -1194,9 +1201,21 @@ static int cluster_enqueue_replication(nm_cluster_t *cluster,
         if (!peer->up) {
             continue;
         }
-        uint8_t message_type =
-            kind == NM_RPC_STORE ? (uint8_t)NM_MSG_REPLICA_STORE
-                                 : (uint8_t)NM_MSG_REPLICA_STORE_OBJECT;
+        uint8_t message_type;
+        switch (kind) {
+        case NM_RPC_STORE:
+            message_type = (uint8_t)NM_MSG_REPLICA_STORE;
+            break;
+        case NM_RPC_STORE_OBJECT:
+            message_type = (uint8_t)NM_MSG_REPLICA_STORE_OBJECT;
+            break;
+        case NM_RPC_DELETE_OBJECT:
+            message_type = (uint8_t)NM_MSG_REPLICA_DELETE_OBJECT;
+            break;
+        default:
+            free(transaction);
+            return NM_ERR_INVALID;
+        }
         result = peer_enqueue_rpc(peer, kind, message_type, NM_MSG_ACK,
                                   message_type, digest, transaction, payload,
                                   payload_length);
@@ -1263,6 +1282,40 @@ int nm_cluster_replicate_manifest(nm_cluster_t *cluster,
                                          key_digest, serialized,
                                          serialized_length, callback, opaque);
     free(serialized);
+    return result;
+}
+
+int nm_cluster_replicate_delete(nm_cluster_t *cluster, const char *key,
+                                uint64_t deleted_ms,
+                                nm_cluster_write_done_fn callback,
+                                void *opaque)
+{
+    uint8_t key_digest[NM_SHA256_LEN];
+    uint8_t *payload;
+    size_t key_length;
+    size_t payload_length;
+    int result;
+
+    if (cluster == NULL || key == NULL || callback == NULL ||
+        !nm_key_is_valid(key) || deleted_ms == 0u) {
+        return NM_ERR_INVALID;
+    }
+    result = nm_manifest_key_hash(key, key_digest);
+    if (result != NM_OK) {
+        return result;
+    }
+    key_length = strlen(key);
+    payload_length = 8u + key_length;
+    payload = malloc(payload_length);
+    if (payload == NULL) {
+        return NM_ERR_NOMEM;
+    }
+    nm_put_u64_be(payload, deleted_ms);
+    memcpy(payload + 8u, key, key_length);
+    result = cluster_enqueue_replication(cluster, NM_RPC_DELETE_OBJECT,
+                                         key_digest, payload, payload_length,
+                                         callback, opaque);
+    free(payload);
     return result;
 }
 

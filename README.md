@@ -21,15 +21,16 @@ It is a systems-programming portfolio project, not a wrapper around a database.
 The storage engine, the binary wire protocol, the event loop, the replication
 logic, the heartbeat/anti-entropy machinery, and the HTTP server are all
 implemented in C11/POSIX. There is **no Raft**, **no FUSE**, no SQL database, and
-no HTTP between storage nodes. The only external runtime dependency is OpenSSL
-for SHA-256.
+no HTTP between storage nodes. The C services' only external runtime dependency
+is OpenSSL for SHA-256. The dashboard is a separate Next.js/TypeScript app in
+`ui/`.
 
 ## Architecture
 
 ```text
                          +-------------------------------+
    HTTP/1.1  ----------> |        netmirror-gateway      |  :8080
-   curl / CLI            |  round-robin + read failover  |
+   curl / CLI / UI       |  newest manifest + failover   |
                          +---------------+---------------+
                                          |
                   binary TCP (no HTTP)   |  STORE / FETCH / ACK
@@ -112,15 +113,40 @@ docker compose down
 rm -rf data1 data2 data3   # wipe the bind-mounted node data
 ```
 
+## Web UI
+
+`ui/` is a Next.js App Router dashboard (TypeScript + Tailwind CSS). It polls
+`/api/health` and shows the cluster status with a green indicator when online.
+`next.config.ts` rewrites `/api/*` to the gateway, so browser calls stay
+same-origin during development.
+
+```bash
+# Terminal 1: C cluster + gateway
+docker compose up -d --build --wait
+
+# Terminal 2: dashboard
+cd ui
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). The proxy defaults to
+`http://localhost:8080`; override it with `NETMIRROR_GATEWAY`. The UI is
+validated with `npm run lint` and `npm run build`.
+
 ## HTTP API
 
-| Method | Path          | Success | Description                                      |
-| ------ | ------------- | ------- | ------------------------------------------------ |
-| `GET`  | `/health`     | `200`   | Gateway liveness as JSON                         |
-| `GET`  | `/obj/<key>`  | `200`   | Stream the object; `ETag` and `X-Content-SHA256` |
-| `GET`  | `/obj`        | `200`   | Same as `/obj/default`                           |
-| `PUT`  | `/obj/<key>`  | `201`   | Stream an object; requires `Content-Length`      |
-| `PUT`  | `/obj`        | `201`   | Same as `/obj/default`                           |
+| Method    | Path          | Success | Description                                      |
+| --------- | ------------- | ------- | ------------------------------------------------ |
+| `GET`     | `/health`     | `200`   | Gateway liveness as JSON                         |
+| `GET`     | `/objects`    | `200`   | Live keys as `{"objects":["key1","key2"]}`       |
+| `GET`     | `/obj/<key>`  | `200`   | Stream the object; `ETag` and `X-Content-SHA256` |
+| `GET`     | `/obj`        | `200`   | Same as `/obj/default`                           |
+| `PUT`     | `/obj/<key>`  | `201`   | Stream an object; requires `Content-Length`      |
+| `PUT`     | `/obj`        | `201`   | Same as `/obj/default`                           |
+| `DELETE`  | `/obj/<key>`  | `204`   | Delete object; `404` if it does not exist        |
+| `DELETE`  | `/obj`        | `204`   | Same as deleting the key `default`               |
+| `OPTIONS` | any valid path| `204`   | CORS preflight; advertises the allowed methods   |
 
 Successful `PUT` responses are JSON:
 
@@ -128,13 +154,22 @@ Successful `PUT` responses are JSON:
 {"key":"readme","size":12345,"chunks":1,"sha256":"6c3d...e91f"}
 ```
 
+CORS is enabled for browser clients:
+
+- `Access-Control-Allow-Origin: *`
+- `Access-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS`
+- `Access-Control-Allow-Headers: Content-Type`
+- `OPTIONS` preflight requests return `204 No Content`.
+
+Other behavior:
+
 - Keys are 1-127 characters from `[A-Za-z0-9._-]`; `.` and `..` are rejected.
 - `Content-Length` is mandatory for `PUT` (`411` otherwise).
 - `Expect: 100-continue` is supported.
 - `Connection: keep-alive` and bounded HTTP pipelining are supported.
 - `Transfer-Encoding: chunked` is **not** supported (`501`).
 - Maximum object size is **4 TiB** (1,048,576 chunks of 4 MiB).
-- There is no `DELETE`, no object listing endpoint, and no `Range` support.
+- There is no `Range`, resume, or multipart support.
 
 Errors are JSON and use conventional status codes: `400`, `404`, `405`, `408`,
 `411`, `413`, `417`, `431`, `500`, `501`, `502`, `503`, `504`, `505`.
@@ -241,8 +276,9 @@ node catches up later through anti-entropy if it was down.
 
 ### Read path
 
-1. The gateway selects a node with round-robin and tries to fetch the manifest
-   (`FETCH_OBJECT`), falling back to the next node on failure or `NOT_FOUND`.
+1. The gateway asks every reachable replica for the manifest (`FETCH_OBJECT`)
+   and keeps the one with the highest `updated_ms`; a tombstone wins a timestamp
+   tie. A tombstone means the object is deleted (`404`).
 2. It streams the object chunk by chunk, selecting nodes in round-robin order
    and falling back on failure.
 3. Every received chunk is hashed and compared with the digest in the manifest
@@ -252,6 +288,29 @@ node catches up later through anti-entropy if it was down.
 
 Reads do not use a quorum. They prefer availability and integrity (per-chunk
 verification) over linearizability.
+
+### Deletion and tombstones
+
+`DELETE /obj/<key>` is sent to a coordinator. The coordinator:
+
+1. loads the live manifest and replaces it atomically with a tombstone whose
+   `updated_ms` is newer than the old manifest;
+2. deletes chunks that are no longer referenced by any live manifest (shared
+   chunks are kept);
+3. fans the deletion out to peers as `REPLICA_DELETE_OBJECT` and returns `204`
+   to the gateway after a 2-of-3 quorum. If no replica has a live manifest, the
+   gateway returns `404`.
+
+Tombstones are first-class manifests with the deleted flag set. They are
+included in `LIST_KEYS_*` anti-entropy, so a node that was offline during a
+delete pulls the tombstone, replaces its old manifest, and removes the orphaned
+chunks. A live manifest with a newer timestamp (a later upload of the same key)
+wins over an older tombstone.
+
+Chunk cleanup is best effort and scans the remaining live manifests, so chunks
+shared by other objects survive. Anti-entropy can transiently pull chunks from a
+stale replica before that replica sees the tombstone; a full garbage collector
+is still future work.
 
 ### Heartbeats, reconnects, and anti-entropy
 
@@ -341,6 +400,7 @@ mean all three have it yet; the third is repaired by anti-entropy.
 | `src/`                       | Implementation of the node, gateway, CLI, storage, cluster      |
 | `tests/`                     | C unit/integration tests and shell-driven scenario tests        |
 | `docker/`                    | Container entrypoint (drops to UID 10001 after fixing data dir) |
+| `ui/`                        | Next.js App Router dashboard (TypeScript + Tailwind CSS)        |
 | `.github/workflows/ci.yml`   | Build/test job and Docker validation job                        |
 | `Dockerfile`                 | Multi-stage Debian Bookworm build and minimal runtime           |
 | `docker-compose.yml`         | Three nodes + one gateway with health checks                    |
@@ -376,7 +436,7 @@ Binaries land in `build/<mode>/bin/`:
 | `make test-network` | Framing, partial parser, byte order, buffers                    |
 | `make test-node`    | Binary protocol server, ACK/ERROR paths, graceful shutdown      |
 | `make test-cluster` | Quorum, crash/recovery, anti-entropy, lone-node rejection       |
-| `make test-gateway` | 10 MiB streaming, keep-alive, `100-continue`, fallback, shutdown |
+| `make test-gateway` | Streaming, keep-alive, CORS, list/delete, tombstone repair      |
 | `make test`         | All of the above plus the end-to-end scenario                   |
 
 The end-to-end test uploads small, 12 MiB, and empty objects, verifies their
@@ -401,23 +461,25 @@ still succeed, and checks every process for sanitizer output on shutdown.
 netmirror is intentionally small enough to read in one sitting. The following
 limitations are deliberate:
 
-- **No TLS and no authentication.** Anyone who can reach the gateway can read or
-  overwrite every object. Run it on a trusted network, behind a VPN, or behind a
+- **No TLS and no authentication.** Anyone who can reach the gateway can read,
+  overwrite, or delete every object. CORS is deliberately permissive for the
+  browser dashboard. Run it on a trusted network, behind a VPN, or behind a
   reverse proxy that terminates TLS and enforces authentication. Data at rest is
   also unencrypted.
-- **No orphan-chunk garbage collection.** A failed multi-chunk upload, or a
-  re-upload that replaces a manifest, can leave chunks that no manifest
-  references. They cost disk space but cannot corrupt reads. A future GC would
-  need to rebuild the live-chunk set from all manifests and coordinate with
-  anti-entropy.
+- **No global orphan-chunk garbage collection.** `DELETE` removes chunks that no
+  longer have a live manifest reference, and tombstone repair does the same on a
+  rejoining node. Failed uploads, overwritten objects, or anti-entropy pulling
+  from a stale replica can still leave orphan chunks. They cost disk space but
+  cannot corrupt reads. A future GC would need to rebuild the live-chunk set
+  from all manifests and coordinate with anti-entropy.
 - **No `Transfer-Encoding: chunked`.** Uploads must carry `Content-Length`
   (`411` without it, `501` for chunked). This keeps the parser small and makes
   streaming bounds explicit. There is also no `Range`, resume, or multipart
   support.
-- **No consensus protocol.** There is no Raft and no leader. Writes use a
-  2-of-3 quorum, while reads are served by a single replica with fallback.
-  Concurrent writes to the same key can both return `201`; the final value is
-  resolved by last-write-wins on the manifest's `updated_ms` during
+- **No consensus protocol.** There is no Raft and no leader. Writes and deletes
+  use a 2-of-3 quorum. GET compares replica manifests and picks the newest one,
+  but concurrent writes to the same key can both return `201`; the final value
+  is resolved by last-write-wins on the manifest's `updated_ms` during
   anti-entropy. Clock skew can delay convergence, and reads are not
   linearizable.
 - **Static membership.** Peers are configured at startup; nodes cannot join or
@@ -430,9 +492,10 @@ limitations are deliberate:
   alive, not that the storage nodes are reachable. Container health checks use
   the binary `node-health` probe; the gateway health check only proves the
   HTTP front end responds.
-- **No external listing or deletion.** Keys are known by their writers. There
-  is no consistency guarantee across a listing because no listing endpoint
-  exists.
+- **Listing is eventually consistent.** `GET /objects` is served by one
+  replica. A stale replica can briefly include a key after a quorum delete until
+  the tombstone reaches it. `GET /obj/<key>` compares replicas, so it returns
+  `404` as soon as a newer tombstone is visible.
 - **Large manifests are one frame.** At the 4 TiB ceiling a manifest carries
   1,048,576 digests (~32 MiB) and must fit in a single frame.
   `NM_MAX_FRAME_PAYLOAD` and the per-connection parser buffer are sized for it,

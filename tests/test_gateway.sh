@@ -3,6 +3,7 @@
 #   - 10 MiB streaming PUT with Expect: 100-continue
 #   - GET hash verification
 #   - HTTP/1.1 keep-alive connection reuse
+#   - CORS, OPTIONS preflight, listing and deletion
 #   - health and 404 responses
 #   - read/write fallback with one of three nodes dead
 #   - graceful shutdown under ASan/UBSan
@@ -298,6 +299,101 @@ NOT_FOUND_CODE=$(curl -sS --max-time 10 -o /dev/null \
 [[ "$NOT_FOUND_CODE" == "404" ]] ||
     die "missing object returned $NOT_FOUND_CODE, expected 404"
 
+# CORS headers and the OPTIONS preflight.
+curl -sS --max-time 10 -D "$TMP_ROOT/cors.headers" -o /dev/null \
+    "http://127.0.0.1:$PORT_GATEWAY/health" ||
+    die "CORS health request failed"
+grep -qi '^Access-Control-Allow-Origin: \*' "$TMP_ROOT/cors.headers" ||
+    die "missing Access-Control-Allow-Origin"
+grep -qi '^Access-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS' \
+    "$TMP_ROOT/cors.headers" || die "missing CORS methods"
+grep -qi '^Access-Control-Allow-Headers: Content-Type' \
+    "$TMP_ROOT/cors.headers" || die "missing CORS headers"
+
+OPTIONS_CODE=$(curl -sS --max-time 10 -X OPTIONS \
+    -H 'Origin: http://localhost:3000' \
+    -H 'Access-Control-Request-Method: DELETE' \
+    -H 'Access-Control-Request-Headers: content-type' \
+    -D "$TMP_ROOT/options.headers" -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:$PORT_GATEWAY/obj/api-shared-a") ||
+    die "OPTIONS preflight failed"
+[[ "$OPTIONS_CODE" == "204" ]] ||
+    die "OPTIONS returned $OPTIONS_CODE, expected 204"
+grep -qi '^Allow: GET, PUT, DELETE, OPTIONS' "$TMP_ROOT/options.headers" ||
+    die "OPTIONS response is missing the Allow header"
+
+# The same content is stored under two keys, so the chunk is shared. Deleting
+# one key must keep the other object readable and must not delete its chunk.
+head -c 4096 /dev/urandom > "$TMP_ROOT/api.bin" ||
+    die "could not create API test object"
+CODE=$(http_put "api-shared-a" "$TMP_ROOT/api.bin" \
+    "$TMP_ROOT/api-put-a.headers" "$TMP_ROOT/api-put-a.body")
+[[ "$CODE" == "201" ]] || die "PUT api-shared-a returned $CODE"
+CODE=$(http_put "api-shared-b" "$TMP_ROOT/api.bin" \
+    "$TMP_ROOT/api-put-b.headers" "$TMP_ROOT/api-put-b.body")
+[[ "$CODE" == "201" ]] || die "PUT api-shared-b returned $CODE"
+
+# A unique object used later to verify that a rejoining node applies the
+# tombstone and removes the now-orphaned chunk.
+head -c 2048 /dev/urandom > "$TMP_ROOT/api-resilient.bin" ||
+    die "could not create resilient test object"
+RESILIENT_SHA=$(sha256sum "$TMP_ROOT/api-resilient.bin" | awk '{print $1}')
+CODE=$(http_put "api-resilient" "$TMP_ROOT/api-resilient.bin" \
+    "$TMP_ROOT/api-resilient-put.headers" "$TMP_ROOT/api-resilient-put.body")
+[[ "$CODE" == "201" ]] || die "PUT api-resilient returned $CODE"
+
+LIST_CODE=$(curl -sS --max-time 10 -o "$TMP_ROOT/objects.json" \
+    -w '%{http_code}' "http://127.0.0.1:$PORT_GATEWAY/objects") ||
+    die "GET /objects failed"
+[[ "$LIST_CODE" == "200" ]] || die "GET /objects returned $LIST_CODE"
+grep -q '"api-shared-a"' "$TMP_ROOT/objects.json" ||
+    die "listing does not contain api-shared-a"
+grep -q '"api-shared-b"' "$TMP_ROOT/objects.json" ||
+    die "listing does not contain api-shared-b"
+
+DELETE_CODE=$(curl -sS --max-time 20 -X DELETE \
+    -D "$TMP_ROOT/delete.headers" -o "$TMP_ROOT/delete.body" \
+    -w '%{http_code}' "http://127.0.0.1:$PORT_GATEWAY/obj/api-shared-a") ||
+    die "DELETE api-shared-a failed"
+[[ "$DELETE_CODE" == "204" ]] ||
+    die "DELETE returned $DELETE_CODE, expected 204"
+grep -qi '^Access-Control-Allow-Origin: \*' "$TMP_ROOT/delete.headers" ||
+    die "DELETE response is missing CORS headers"
+
+CODE=$(http_get "api-shared-a" "$TMP_ROOT/api-deleted.bin" \
+    "$TMP_ROOT/api-deleted.headers")
+[[ "$CODE" == "404" ]] ||
+    die "GET deleted object returned $CODE, expected 404"
+
+LIST_OK=0
+for _ in $(seq 1 30); do
+    LIST_BODY=$(curl -sS --max-time 10 \
+        "http://127.0.0.1:$PORT_GATEWAY/objects") ||
+        die "listing after DELETE failed"
+    if ! grep -q '"api-shared-a"' <<<"$LIST_BODY"; then
+        LIST_OK=1
+        break
+    fi
+    sleep 0.1
+done
+(( LIST_OK == 1 )) ||
+    die "deleted key is still listed: $LIST_BODY"
+grep -q '"api-shared-b"' <<<"$LIST_BODY" ||
+    die "listing lost api-shared-b after DELETE"
+
+CODE=$(http_get "api-shared-b" "$TMP_ROOT/api-shared.bin" \
+    "$TMP_ROOT/api-shared.headers")
+[[ "$CODE" == "200" ]] ||
+    die "GET api-shared-b after DELETE returned $CODE"
+cmp -s "$TMP_ROOT/api.bin" "$TMP_ROOT/api-shared.bin" ||
+    die "shared chunk was removed by DELETE"
+
+MISSING_DELETE_CODE=$(curl -sS --max-time 10 -X DELETE -o /dev/null \
+    -w '%{http_code}' "http://127.0.0.1:$PORT_GATEWAY/obj/api-missing") ||
+    die "DELETE missing object failed"
+[[ "$MISSING_DELETE_CODE" == "404" ]] ||
+    die "DELETE missing returned $MISSING_DELETE_CODE, expected 404"
+
 # Kill a replica. Reads must fall back and writes still reach 2-of-3 quorum.
 KILLED_NODE3=$PID3
 kill -KILL "$KILLED_NODE3" 2>/dev/null || die "could not kill node3"
@@ -322,12 +418,48 @@ CODE=$(http_get "gateway-beta" "$TMP_ROOT/get2.bin" "$TMP_ROOT/get2.headers")
 SECOND_GET_SHA=$(sha256sum "$TMP_ROOT/get2.bin" | awk '{print $1}')
 [[ "$SECOND_GET_SHA" == "$SECOND_SHA" ]] || die "second object hash mismatch"
 
+# Delete while node3 is down. The tombstone reaches quorum on node1/node2.
+DELETE_CODE=$(curl -sS --max-time 20 -X DELETE -o /dev/null \
+    -w '%{http_code}' \
+    "http://127.0.0.1:$PORT_GATEWAY/obj/api-resilient") ||
+    die "DELETE api-resilient with node3 down failed"
+[[ "$DELETE_CODE" == "204" ]] ||
+    die "DELETE api-resilient returned $DELETE_CODE"
+CODE=$(http_get "api-resilient" "$TMP_ROOT/resilient-deleted.bin" \
+    "$TMP_ROOT/resilient-deleted.headers")
+[[ "$CODE" == "404" ]] ||
+    die "GET deleted api-resilient returned $CODE"
+
+# Restart node3 with its old live manifest and chunk. Anti-entropy must pull
+# the newer tombstone, delete the manifest and remove the orphan chunk.
+start_node 3 "$LOG3"
+wait_tcp "$PORT3" || die "node3 did not restart"
+wait_peer_up "$LOG3" 2 || die "node3 did not reconnect to both peers"
+
+CHUNK_GONE=0
+for _ in $(seq 1 80); do
+    if [[ ! -f "$TMP_ROOT/node3-data/chunks/$RESILIENT_SHA" ]]; then
+        CHUNK_GONE=1
+        break
+    fi
+    sleep 0.1
+done
+(( CHUNK_GONE == 1 )) ||
+    die "node3 did not remove the tombstoned chunk"
+
+CODE=$(http_get "api-resilient" "$TMP_ROOT/resilient-after-rejoin.bin" \
+    "$TMP_ROOT/resilient-after-rejoin.headers")
+[[ "$CODE" == "404" ]] ||
+    die "GET api-resilient after node3 rejoin returned $CODE"
+
 stop_gracefully "$GATEWAY_PID" "gateway" "$GATEWAY_LOG"
 GATEWAY_PID=""
 stop_gracefully "$PID1" "node1" "$LOG1"
 PID1=""
 stop_gracefully "$PID2" "node2" "$LOG2"
 PID2=""
+stop_gracefully "$PID3" "node3" "$LOG3"
+PID3=""
 
-echo "test_gateway: 10MiB streaming, keep-alive, 100-continue, fallback and shutdown passed"
+echo "test_gateway: 10MiB streaming, keep-alive, 100-continue, CORS, list/delete, tombstone repair, fallback and shutdown passed"
 exit 0

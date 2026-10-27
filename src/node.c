@@ -863,9 +863,9 @@ static node_dispatch_result_t handle_sync(node_server_t *server,
     return queued ? NODE_DISPATCH_KEEP : NODE_DISPATCH_FATAL;
 }
 
-static node_dispatch_result_t handle_list_keys(
+static node_dispatch_result_t handle_list_keys_common(
     node_server_t *server, node_connection_t *connection,
-    const nm_frame_t *frame)
+    const nm_frame_t *frame, bool include_tombstones, uint8_t response_type)
 {
     char **keys = NULL;
     size_t count = 0u;
@@ -882,18 +882,20 @@ static node_dispatch_result_t handle_list_keys(
     if (frame->length != NM_LIST_KEYS_REQ_WIRE_SIZE ||
         frame->payload == NULL) {
         return node_fail(connection, NM_ERR_PROTOCOL,
-                         "invalid LIST_KEYS_REQ");
+                         "invalid list request");
     }
     offset = nm_get_u32_be(frame->payload);
     requested = nm_get_u32_be(frame->payload + 4u);
     if (requested == 0u) {
         return node_fail(connection, NM_ERR_PROTOCOL,
-                         "LIST_KEYS_REQ limit must be non-zero");
+                         "list limit must be non-zero");
     }
     if (requested > NM_LIST_KEYS_DEFAULT_BATCH) {
         requested = NM_LIST_KEYS_DEFAULT_BATCH;
     }
-    status = nm_store_list_keys(&server->store, &keys, &count);
+    status = include_tombstones
+                 ? nm_store_list_keys(&server->store, &keys, &count)
+                 : nm_store_list_live_keys(&server->store, &keys, &count);
     if (status != NM_OK) {
         return node_fail(connection, status, "could not list manifests");
     }
@@ -932,10 +934,136 @@ static node_dispatch_result_t handle_list_keys(
         cursor += key_length;
     }
     nm_store_free_keys(keys, count);
-    queued = node_queue_frame(connection, NM_MSG_LIST_KEYS_RESP, response,
+    queued = node_queue_frame(connection, response_type, response,
                               (uint64_t)response_length);
     free(response);
     return queued ? NODE_DISPATCH_KEEP : NODE_DISPATCH_FATAL;
+}
+
+static node_dispatch_result_t handle_list_keys(
+    node_server_t *server, node_connection_t *connection,
+    const nm_frame_t *frame)
+{
+    return handle_list_keys_common(server, connection, frame, true,
+                                   NM_MSG_LIST_KEYS_RESP);
+}
+
+static node_dispatch_result_t handle_list_objects(
+    node_server_t *server, node_connection_t *connection,
+    const nm_frame_t *frame)
+{
+    return handle_list_keys_common(server, connection, frame, false,
+                                   NM_MSG_LIST_OBJECTS_RESP);
+}
+
+static bool parse_delete_key(const nm_frame_t *frame, bool replica,
+                             char key[NM_MAX_KEY], uint64_t *deleted_ms)
+{
+    const uint8_t *key_data;
+    size_t key_length;
+    size_t prefix = replica ? 8u : 0u;
+
+    if (frame->payload == NULL || frame->length <= prefix) {
+        return false;
+    }
+    if (replica) {
+        if (deleted_ms == NULL) {
+            return false;
+        }
+        *deleted_ms = nm_get_u64_be(frame->payload);
+        if (*deleted_ms == 0u) {
+            return false;
+        }
+    }
+    key_length = (size_t)(frame->length - prefix);
+    if (key_length == 0u || key_length >= NM_MAX_KEY) {
+        return false;
+    }
+    key_data = frame->payload + prefix;
+    if (memchr(key_data, '\0', key_length) != NULL) {
+        return false;
+    }
+    memcpy(key, key_data, key_length);
+    key[key_length] = '\0';
+    return nm_key_is_valid(key);
+}
+
+static node_dispatch_result_t node_replicate_delete_async(
+    node_server_t *server, node_connection_t *connection, const char *key,
+    uint64_t deleted_ms, const uint8_t key_digest[NM_SHA256_LEN])
+{
+    node_write_op_t *operation = calloc(1u, sizeof(*operation));
+    int result;
+
+    if (operation == NULL) {
+        if (!node_send_ack(connection, NM_ERR_NOMEM, NM_MSG_DELETE_OBJECT,
+                           key_digest)) {
+            return NODE_DISPATCH_FATAL;
+        }
+        return NODE_DISPATCH_KEEP;
+    }
+    operation->connection = connection;
+    operation->ack_type = (uint8_t)NM_MSG_DELETE_OBJECT;
+    memcpy(operation->digest, key_digest, NM_SHA256_LEN);
+    connection->pending_writes += 1u;
+    result = nm_cluster_replicate_delete(server->cluster, key, deleted_ms,
+                                         node_write_done, operation);
+    if (result != NM_OK) {
+        connection->pending_writes -= 1u;
+        free(operation);
+        if (!node_send_ack(connection, (nm_status_t)result,
+                           NM_MSG_DELETE_OBJECT, key_digest)) {
+            return NODE_DISPATCH_FATAL;
+        }
+    }
+    return NODE_DISPATCH_KEEP;
+}
+
+static node_dispatch_result_t handle_delete_object(
+    node_server_t *server, node_connection_t *connection,
+    const nm_frame_t *frame, bool replica)
+{
+    char key[NM_MAX_KEY];
+    uint8_t key_digest[NM_SHA256_LEN];
+    uint64_t deleted_ms = 0u;
+    nm_status_t status;
+    int result;
+
+    if (!parse_delete_key(frame, replica, key, &deleted_ms)) {
+        return node_fail(connection, NM_ERR_PROTOCOL, "invalid DELETE payload");
+    }
+    result = nm_manifest_key_hash(key, key_digest);
+    if (result != NM_OK) {
+        return node_fail(connection, (nm_status_t)result,
+                         "invalid object key");
+    }
+    if (replica) {
+        status = (nm_status_t)nm_store_apply_tombstone(&server->store, key,
+                                                       deleted_ms);
+        if (!node_send_ack(connection, status, NM_MSG_REPLICA_DELETE_OBJECT,
+                           key_digest)) {
+            return NODE_DISPATCH_FATAL;
+        }
+        return NODE_DISPATCH_KEEP;
+    }
+    status = (nm_status_t)nm_store_delete_manifest(&server->store, key,
+                                                   &deleted_ms);
+    if (status != NM_OK) {
+        if (!node_send_ack(connection, status, NM_MSG_DELETE_OBJECT,
+                           key_digest)) {
+            return NODE_DISPATCH_FATAL;
+        }
+        return NODE_DISPATCH_KEEP;
+    }
+    if (server->cluster == NULL) {
+        if (!node_send_ack(connection, NM_OK, NM_MSG_DELETE_OBJECT,
+                           key_digest)) {
+            return NODE_DISPATCH_FATAL;
+        }
+        return NODE_DISPATCH_KEEP;
+    }
+    return node_replicate_delete_async(server, connection, key, deleted_ms,
+                                       key_digest);
 }
 
 static node_dispatch_result_t dispatch_frame(node_server_t *server,
@@ -963,16 +1091,23 @@ static node_dispatch_result_t dispatch_frame(node_server_t *server,
         return handle_store_object(server, connection, frame, true);
     case NM_MSG_FETCH_OBJECT:
         return handle_fetch_object(server, connection, frame);
+    case NM_MSG_DELETE_OBJECT:
+        return handle_delete_object(server, connection, frame, false);
+    case NM_MSG_REPLICA_DELETE_OBJECT:
+        return handle_delete_object(server, connection, frame, true);
     case NM_MSG_SYNC_REQ:
         return handle_sync(server, connection, frame);
     case NM_MSG_LIST_KEYS_REQ:
         return handle_list_keys(server, connection, frame);
+    case NM_MSG_LIST_OBJECTS_REQ:
+        return handle_list_objects(server, connection, frame);
     case NM_MSG_ACK:
     case NM_MSG_ERROR:
     case NM_MSG_CHUNK:
     case NM_MSG_OBJECT:
     case NM_MSG_SYNC_RESP:
     case NM_MSG_LIST_KEYS_RESP:
+    case NM_MSG_LIST_OBJECTS_RESP:
         return node_fail_and_close(connection, NM_ERR_PROTOCOL,
                                    "unsupported request type");
     default:
