@@ -29,6 +29,7 @@ vgcore.*
 # Assistant/session artifacts
 /contexto.jsonl
 /.commandcode/
+/command-code-session-*.html
 
 # Local environment and editor files
 .env
